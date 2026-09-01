@@ -104,6 +104,7 @@ const LEGACY_METHODS = {
   proposedPlan: '_acp_ext:codex_proposed_plan',
   claudeTaskLifecycle: '_claude/taskLifecycle',
   kimiTaskLifecycle: '_kimi/taskLifecycle',
+  cursorCreatePlan: '_cursor/create_plan',
 } as const;
 
 export type LodyExtensionEvent =
@@ -197,5 +198,33 @@ export function parseLodyExtensionMessage(args: {
   if (method === LEGACY_METHODS.kimiTaskLifecycle) {
     return { type: 'legacyTaskLifecycle', provider: 'kimi', params: args.params };
   }
+
+  // Handle cursor-agent's plan delivery via _cursor/create_plan extension.
+  // cursor-agent sends this to present the plan for approval; Lody maps it
+  // onto the existing legacyProposedPlan → plan_update rendering pipeline.
+  // See issue #258.
+  if (method === LEGACY_METHODS.cursorCreatePlan) {
+    const CursorPlanSchema = z.object({
+      plan: z.string(),
+      sessionId: z.string().optional(),
+      turnId: z.string().optional(),
+    });
+    const parsed = CursorPlanSchema.safeParse(args.params);
+    if (parsed.success) {
+      return {
+        type: 'legacyProposedPlan',
+        plan: {
+          schemaVersion: 1,
+          sessionId: parsed.data.sessionId ?? args.sessionId,
+          turnId: parsed.data.turnId ?? args.sessionId,
+          markdown: parsed.data.plan,
+          status: 'completed',
+          isLatest: true,
+        },
+      };
+    }
+    return null;
+  }
+
   return null;
 }

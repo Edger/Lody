@@ -1236,7 +1236,11 @@ const sanitizeToolCallContentForHistory = (
   content: ToolCallMessageContent['content'] | undefined,
   kind: ToolCallMessageContent['kind'] | undefined
 ): ToolCallMessageContent['content'] | undefined => {
-  if (!content) return undefined;
+  // Treat empty arrays as undefined so that `toolCall.content ?? tool.content`
+  // correctly falls back to the permission request's content (e.g. plan text
+  // from ExitPlanMode). Without this, `[]` (truthy) wins the ?? and the plan
+  // is silently dropped. See issue #258.
+  if (!content || (Array.isArray(content) && content.length === 0)) return undefined;
   const filtered = stripToolCallContentForHistory(kind ?? null, content);
   return filtered.length ? filtered : undefined;
 };
