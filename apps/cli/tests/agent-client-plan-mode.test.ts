@@ -1527,4 +1527,119 @@ describe('AgentClient goal session info', () => {
     expect(onThreadGoalUpdated).not.toHaveBeenCalled();
     expect(onUpdateMessage).toHaveBeenCalledTimes(1);
   });
+
+  describe('cursor/create_plan blocking extension', () => {
+    it('renders plan and returns accepted when user accepts', async () => {
+      const { client, onUpdateMessage, onRequestPermission } = createTestClient();
+      onRequestPermission.mockImplementationOnce(async () => ({
+        outcome: { outcome: 'selected', optionId: 'accept' },
+      }));
+
+      const result = await client.extMethod('_cursor/create_plan', {
+        plan: '## Plan\n1. Step one\n2. Step two',
+        sessionId: 'acp-test',
+        turnId: 'cursor-turn-1',
+        toolCallId: 'tc-cursor-1',
+      });
+
+      // Should render the plan in the session UI.
+      expect(onUpdateMessage).toHaveBeenCalledWith(
+        expect.objectContaining({
+          sessionId: 'acp-test',
+          update: expect.objectContaining({
+            sessionUpdate: 'plan_update',
+            plan: {
+              type: 'markdown',
+              planId: 'cursor-turn-1',
+              content: '## Plan\n1. Step one\n2. Step two',
+            },
+          }),
+        })
+      );
+
+      // Should request permission with the plan content.
+      expect(onRequestPermission).toHaveBeenCalledWith(
+        expect.any(String),
+        expect.objectContaining({
+          sessionId: 'acp-test',
+          toolCall: expect.objectContaining({
+            toolCallId: 'tc-cursor-1',
+            title: 'Approve plan',
+            kind: 'execute',
+          }),
+          options: expect.arrayContaining([
+            expect.objectContaining({ optionId: 'accept', name: 'Accept' }),
+            expect.objectContaining({ optionId: 'reject', name: 'Reject' }),
+          ]),
+        })
+      );
+
+      // Should return accepted outcome to cursor agent.
+      expect(result).toEqual({ outcome: { outcome: 'accepted' } });
+    });
+
+    it('returns cancelled when user rejects', async () => {
+      const { client, onRequestPermission } = createTestClient();
+      onRequestPermission.mockImplementationOnce(async () => ({
+        outcome: { outcome: 'selected', optionId: 'reject' },
+      }));
+
+      const result = await client.extMethod('_cursor/create_plan', {
+        plan: '## Plan\n1. Step one',
+        sessionId: 'acp-test',
+      });
+
+      expect(result).toEqual({ outcome: { outcome: 'cancelled' } });
+    });
+
+    it('returns cancelled when user cancels permission dialog', async () => {
+      const { client, onRequestPermission } = createTestClient();
+      onRequestPermission.mockImplementationOnce(async () => ({
+        outcome: { outcome: 'cancelled' },
+      }));
+
+      const result = await client.extMethod('_cursor/create_plan', {
+        plan: '## Plan\n1. Step one',
+        sessionId: 'acp-test',
+      });
+
+      expect(result).toEqual({ outcome: { outcome: 'cancelled' } });
+    });
+
+    it('returns cancelled for invalid params', async () => {
+      const { client } = createTestClient();
+
+      const result = await client.extMethod('_cursor/create_plan', {
+        // Missing required 'plan' field
+        sessionId: 'acp-test',
+      });
+
+      expect(result).toEqual({ outcome: { outcome: 'cancelled' } });
+    });
+
+    it('uses default sessionId and turnId when not provided', async () => {
+      const { client, onUpdateMessage, onRequestPermission } = createTestClient();
+      onRequestPermission.mockImplementationOnce(async () => ({
+        outcome: { outcome: 'selected', optionId: 'accept' },
+      }));
+
+      await client.extMethod('_cursor/create_plan', {
+        plan: '## Plan\n1. Step one',
+      });
+
+      // Should use acpSessionId (set to 'acp-test' in test setup) as fallback.
+      expect(onUpdateMessage).toHaveBeenCalledWith(
+        expect.objectContaining({
+          sessionId: 'acp-test',
+        })
+      );
+
+      expect(onRequestPermission).toHaveBeenCalledWith(
+        expect.any(String),
+        expect.objectContaining({
+          sessionId: 'acp-test',
+        })
+      );
+    });
+  });
 });
