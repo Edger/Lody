@@ -1331,10 +1331,12 @@ const mergeToolCallWithPermission = (
   const kind = (toolCall.kind ?? tool.kind ?? undefined) as
     | ToolCallMessageContent['kind']
     | undefined;
-  const content = sanitizeToolCallContentForHistory(
-    toolCall.content ?? tool.content ?? undefined,
-    kind
-  );
+  // Sanitize both sides before the ?? fallback so that an empty persisted
+  // array (e.g. from streaming) does not shadow the permission request's
+  // content (e.g. plan text from ExitPlanMode). See issue #258.
+  const sanitizedToolCallContent = sanitizeToolCallContentForHistory(toolCall.content, kind);
+  const sanitizedToolContent = sanitizeToolCallContentForHistory(tool.content ?? undefined, kind);
+  const content = sanitizedToolCallContent ?? sanitizedToolContent;
   const locations =
     toolCall.locations ??
     (Array.isArray(tool.locations) && tool.locations.length > 0 ? tool.locations : undefined) ??
