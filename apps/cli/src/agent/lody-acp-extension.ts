@@ -118,6 +118,12 @@ export type LodyExtensionEvent =
       readonly type: 'legacyTaskLifecycle';
       readonly provider: 'claude' | 'kimi';
       readonly params: Record<string, unknown>;
+    }
+  | {
+      readonly type: 'cursorPlanApproval';
+      readonly sessionId: string;
+      readonly toolCallId: string;
+      readonly plan: string;
     };
 
 export function parseLodyExtensionCapabilities(
@@ -200,27 +206,23 @@ export function parseLodyExtensionMessage(args: {
   }
 
   // Handle cursor-agent's plan delivery via _cursor/create_plan extension.
-  // cursor-agent sends this to present the plan for approval; Lody maps it
-  // onto the existing legacyProposedPlan → plan_update rendering pipeline.
+  // cursor-agent sends this as a blocking extension that must be wired to an
+  // approval decision — the client renders the plan, asks the user to approve
+  // or reject, and returns the outcome so cursor-agent can continue.
   // See issue #258.
   if (method === LEGACY_METHODS.cursorCreatePlan) {
     const CursorPlanSchema = z.object({
       plan: z.string(),
       sessionId: z.string().optional(),
-      turnId: z.string().optional(),
+      toolCallId: z.string().optional(),
     });
     const parsed = CursorPlanSchema.safeParse(args.params);
     if (parsed.success) {
       return {
-        type: 'legacyProposedPlan',
-        plan: {
-          schemaVersion: 1,
-          sessionId: parsed.data.sessionId ?? args.sessionId,
-          turnId: parsed.data.turnId ?? args.sessionId,
-          markdown: parsed.data.plan,
-          status: 'completed',
-          isLatest: true,
-        },
+        type: 'cursorPlanApproval',
+        sessionId: parsed.data.sessionId ?? args.sessionId,
+        toolCallId: parsed.data.toolCallId ?? `cursor-plan:${args.sessionId}`,
+        plan: parsed.data.plan,
       };
     }
     return null;

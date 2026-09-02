@@ -1382,7 +1382,7 @@ export class AgentClient implements acp.Client {
       return this.handleCursorCreatePlan(params);
     }
     try {
-      await this.handleExtensionMessage(method, params);
+      return (await this.handleExtensionMessage(method, params)) ?? {};
     } catch (error) {
       this.logger.warn(`Error handling extension method ${method}: ${error}`);
     }
@@ -1480,7 +1480,7 @@ export class AgentClient implements acp.Client {
   private async handleExtensionMessage(
     method: string,
     params: Record<string, unknown>
-  ): Promise<void> {
+  ): Promise<Record<string, unknown> | void> {
     const logicalMethod = method.startsWith('_') ? method.slice(1) : method;
     if (logicalMethod === this.acknowledgedSteerCapability?.appliedNotificationMethod) {
       await this.handleSteerApplied(logicalMethod, params);
@@ -1535,6 +1535,44 @@ export class AgentClient implements acp.Client {
           this.tryHandleKimiTaskLifecycleExtension(logicalMethod, event.params);
         }
         return;
+      case 'cursorPlanApproval': {
+        // cursor/create_plan is a blocking extension: emit the plan for rendering,
+        // then request a switch_mode approval so the user can accept or reject.
+        this.ensureSessionMatch(event.sessionId as ACPSessionId);
+        // 1. Emit plan_update so the plan content renders in the session.
+        this.options.onUpdateMessage(
+          parseSessionNotification({
+            sessionId: event.sessionId,
+            update: {
+              sessionUpdate: 'plan_update',
+              plan: {
+                type: 'markdown',
+                planId: event.toolCallId,
+                content: event.plan,
+              },
+            },
+          })
+        );
+        // 2. Request permission via switch_mode so the approval card renders.
+        const requestId = randomUUID();
+        const syntheticRequest: acp.RequestPermissionRequest = {
+          sessionId: event.sessionId as ACPSessionId,
+          toolCall: {
+            toolCallId: event.toolCallId,
+            title: 'Ready to code?',
+            kind: 'switch_mode',
+            status: 'pending',
+            content: [{ type: 'content', content: { type: 'text', text: event.plan } }],
+            rawInput: { plan: event.plan },
+          },
+          options: [
+            { kind: 'allow_once', name: 'Yes, implement this plan', optionId: 'accept' },
+            { kind: 'reject_once', name: 'No, keep planning', optionId: 'reject' },
+          ],
+        };
+        const response = await this.options.onRequestPermission(requestId, syntheticRequest);
+        return { outcome: response.outcome };
+      }
     }
   }
 
