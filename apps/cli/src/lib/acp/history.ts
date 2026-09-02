@@ -1236,11 +1236,7 @@ const sanitizeToolCallContentForHistory = (
   content: ToolCallMessageContent['content'] | undefined,
   kind: ToolCallMessageContent['kind'] | undefined
 ): ToolCallMessageContent['content'] | undefined => {
-  // Treat empty arrays as undefined so that `toolCall.content ?? tool.content`
-  // correctly falls back to the permission request's content (e.g. plan text
-  // from ExitPlanMode). Without this, `[]` (truthy) wins the ?? and the plan
-  // is silently dropped. See issue #258.
-  if (!content || (Array.isArray(content) && content.length === 0)) return undefined;
+  if (!content) return undefined;
   const filtered = stripToolCallContentForHistory(kind ?? null, content);
   return filtered.length ? filtered : undefined;
 };
@@ -1331,12 +1327,10 @@ const mergeToolCallWithPermission = (
   const kind = (toolCall.kind ?? tool.kind ?? undefined) as
     | ToolCallMessageContent['kind']
     | undefined;
-  // Sanitize both sides before the ?? fallback so that an empty persisted
-  // array (e.g. from streaming) does not shadow the permission request's
-  // content (e.g. plan text from ExitPlanMode). See issue #258.
-  const sanitizedToolCallContent = sanitizeToolCallContentForHistory(toolCall.content, kind);
-  const sanitizedToolContent = sanitizeToolCallContentForHistory(tool.content ?? undefined, kind);
-  const content = sanitizedToolCallContent ?? sanitizedToolContent;
+  const content = sanitizeToolCallContentForHistory(
+    toolCall.content ?? tool.content ?? undefined,
+    kind
+  );
   const locations =
     toolCall.locations ??
     (Array.isArray(tool.locations) && tool.locations.length > 0 ? tool.locations : undefined) ??
