@@ -123,6 +123,7 @@ export type LodyExtensionEvent =
       readonly type: 'cursorPlanApproval';
       readonly sessionId: string;
       readonly toolCallId: string;
+      readonly planId: string;
       readonly plan: string;
     }
   | {
@@ -222,10 +223,16 @@ export function parseLodyExtensionMessage(args: {
     });
     const parsed = CursorPlanSchema.safeParse(args.params);
     if (parsed.success) {
+      const sessionId = parsed.data.sessionId ?? args.sessionId;
       return {
         type: 'cursorPlanApproval',
-        sessionId: parsed.data.sessionId ?? args.sessionId,
-        toolCallId: parsed.data.toolCallId ?? `cursor-plan:${args.sessionId}`,
+        sessionId,
+        toolCallId: parsed.data.toolCallId ?? `cursor-plan:${sessionId}`,
+        // The displayed plan keys on a stable per-session id so a revised plan
+        // (fresh toolCallId after "No, keep planning") replaces the previous one
+        // instead of accumulating next to it; the approval tool-call keeps the
+        // unique cursor-supplied id.
+        planId: `cursor-plan:${sessionId}`,
         plan: parsed.data.plan,
       };
     }

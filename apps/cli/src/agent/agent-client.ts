@@ -1459,7 +1459,9 @@ export class AgentClient implements acp.Client {
         // cursor/create_plan is a blocking extension: emit the plan for rendering,
         // then request a switch_mode approval so the user can accept or reject.
         this.ensureSessionMatch(event.sessionId as ACPSessionId);
-        // 1. Emit plan_update so the plan content renders in the session.
+        // 1. Emit plan_update so the plan content renders in the session. The
+        // plan keys on the adapter's stable per-session planId, not the unique
+        // approval toolCallId, so a revised plan replaces the previous one.
         this.options.onUpdateMessage(
           parseSessionNotification({
             sessionId: event.sessionId,
@@ -1467,7 +1469,7 @@ export class AgentClient implements acp.Client {
               sessionUpdate: 'plan_update',
               plan: {
                 type: 'markdown',
-                planId: event.toolCallId,
+                planId: event.planId,
                 content: event.plan,
               },
             },

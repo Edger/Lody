@@ -1542,7 +1542,9 @@ describe('AgentClient goal session info', () => {
         toolCallId: 'tc-cursor-1',
       });
 
-      // Should render the plan in the session UI.
+      // Should render the plan in the session UI. The displayed plan keys on a
+      // stable per-session id so a revised plan replaces the previous one; the
+      // unique cursor toolCallId belongs to the approval card only.
       expect(onUpdateMessage).toHaveBeenCalledWith(
         expect.objectContaining({
           sessionId: 'acp-test',
@@ -1550,7 +1552,7 @@ describe('AgentClient goal session info', () => {
             sessionUpdate: 'plan_update',
             plan: {
               type: 'markdown',
-              planId: 'tc-cursor-1',
+              planId: 'cursor-plan:acp-test',
               content: '## Plan\n1. Step one\n2. Step two',
             },
           }),
@@ -1576,6 +1578,37 @@ describe('AgentClient goal session info', () => {
 
       // Should return accepted outcome to cursor agent.
       expect(result).toEqual({ outcome: { outcome: 'accepted' } });
+    });
+
+    it('replaces the displayed plan when a revised plan arrives with a fresh toolCallId', async () => {
+      const { client, onUpdateMessage, onRequestPermission } = createTestClient();
+      onRequestPermission.mockImplementation(async () => ({
+        outcome: { outcome: 'selected', optionId: 'reject' },
+      }));
+
+      await client.extMethod('_cursor/create_plan', {
+        plan: '## Plan v1',
+        sessionId: 'acp-test',
+        toolCallId: 'tc-cursor-1',
+      });
+      await client.extMethod('_cursor/create_plan', {
+        plan: '## Plan v2',
+        sessionId: 'acp-test',
+        toolCallId: 'tc-cursor-2',
+      });
+
+      // Both revisions emit the same stable planId so the second plan replaces
+      // the first instead of accumulating next to it.
+      const planIds = onUpdateMessage.mock.calls.map(
+        (call) => (call[0] as { update: { plan?: { planId?: string } } }).update.plan?.planId
+      );
+      expect(planIds).toEqual(['cursor-plan:acp-test', 'cursor-plan:acp-test']);
+
+      // Each approval card keeps its own unique cursor toolCallId.
+      const approvalToolCallIds = onRequestPermission.mock.calls.map(
+        (call) => (call[1] as RequestPermissionRequest).toolCall.toolCallId
+      );
+      expect(approvalToolCallIds).toEqual(['tc-cursor-1', 'tc-cursor-2']);
     });
 
     it('returns cancelled when user rejects', async () => {
