@@ -1565,7 +1565,7 @@ describe('AgentClient goal session info', () => {
           toolCall: expect.objectContaining({
             toolCallId: 'tc-cursor-1',
             title: 'Approve plan',
-            kind: 'execute',
+            kind: 'switch_mode',
           }),
           options: expect.arrayContaining([
             expect.objectContaining({ optionId: 'accept', name: 'Accept' }),

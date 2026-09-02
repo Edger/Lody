@@ -1424,6 +1424,7 @@ export class AgentClient implements acp.Client {
     }
 
     const sessionId = parsed.data.sessionId ?? this.acpSessionId ?? this.options.sessionId;
+    this.ensureSessionMatch(sessionId as ACPSessionId);
     const turnId = parsed.data.turnId ?? sessionId;
     const toolCallId = parsed.data.toolCallId ?? `cursor-plan:${turnId}`;
 
@@ -1449,7 +1450,7 @@ export class AgentClient implements acp.Client {
       toolCall: {
         toolCallId,
         title: 'Approve plan',
-        kind: 'execute',
+        kind: 'switch_mode',
         content: [{ type: 'content', content: { type: 'text', text: parsed.data.plan } }],
       },
       options: [
