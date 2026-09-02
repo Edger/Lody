@@ -1550,7 +1550,7 @@ describe('AgentClient goal session info', () => {
             sessionUpdate: 'plan_update',
             plan: {
               type: 'markdown',
-              planId: 'cursor-turn-1',
+              planId: 'tc-cursor-1',
               content: '## Plan\n1. Step one\n2. Step two',
             },
           }),
@@ -1564,12 +1564,12 @@ describe('AgentClient goal session info', () => {
           sessionId: 'acp-test',
           toolCall: expect.objectContaining({
             toolCallId: 'tc-cursor-1',
-            title: 'Approve plan',
+            title: 'Ready to code?',
             kind: 'switch_mode',
           }),
           options: expect.arrayContaining([
-            expect.objectContaining({ optionId: 'accept', name: 'Accept' }),
-            expect.objectContaining({ optionId: 'reject', name: 'Reject' }),
+            expect.objectContaining({ optionId: 'accept', name: 'Yes, implement this plan' }),
+            expect.objectContaining({ optionId: 'reject', name: 'No, keep planning' }),
           ]),
         })
       );
@@ -1617,7 +1617,7 @@ describe('AgentClient goal session info', () => {
       expect(result).toEqual({ outcome: { outcome: 'cancelled' } });
     });
 
-    it('uses default sessionId and turnId when not provided', async () => {
+    it('uses default sessionId when not provided', async () => {
       const { client, onUpdateMessage, onRequestPermission } = createTestClient();
       onRequestPermission.mockImplementationOnce(async () => ({
         outcome: { outcome: 'selected', optionId: 'accept' },

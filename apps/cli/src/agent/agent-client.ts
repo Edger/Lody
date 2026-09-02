@@ -1376,11 +1376,6 @@ export class AgentClient implements acp.Client {
     method: string,
     params: Record<string, unknown>
   ): Promise<Record<string, unknown>> {
-    // cursor/create_plan is a blocking extension that requires user approval.
-    // Handle it specially to wait for the user's decision and return the outcome.
-    if (method === '_cursor/create_plan') {
-      return this.handleCursorCreatePlan(params);
-    }
     try {
       return (await this.handleExtensionMessage(method, params)) ?? {};
     } catch (error) {
@@ -1395,87 +1390,6 @@ export class AgentClient implements acp.Client {
     } catch (error) {
       this.logger.warn(`Error handling extension notification ${method}: ${error}`);
     }
-  }
-
-  /**
-   * Handle cursor-agent's blocking create_plan extension.
-   * cursor-agent sends this to present the plan for approval; Lody must:
-   * 1. Parse the plan and render it via the legacyProposedPlan pipeline
-   * 2. Present a permission request to the user
-   * 3. Wait for the user's decision
-   * 4. Return { outcome: { outcome: "accepted" | "rejected" | "cancelled" } }
-   * See https://prod.cursor.com/docs/cli/acp and issue #258.
-   */
-  private async handleCursorCreatePlan(
-    params: Record<string, unknown>
-  ): Promise<Record<string, unknown>> {
-    const CursorPlanSchema = z.object({
-      plan: z.string(),
-      sessionId: z.string().optional(),
-      turnId: z.string().optional(),
-      toolCallId: z.string().optional(),
-    });
-    const parsed = CursorPlanSchema.safeParse(params);
-    if (!parsed.success) {
-      this.logger.warn(
-        `[${this.options.sessionId}] Invalid cursor/create_plan params: ${parsed.error.message}`
-      );
-      return { outcome: { outcome: 'cancelled' } };
-    }
-
-    const sessionId = parsed.data.sessionId ?? this.acpSessionId ?? this.options.sessionId;
-    this.ensureSessionMatch(sessionId as ACPSessionId);
-    const turnId = parsed.data.turnId ?? sessionId;
-    const toolCallId = parsed.data.toolCallId ?? `cursor-plan:${turnId}`;
-
-    // Render the plan in the session UI via the existing legacyProposedPlan pipeline.
-    this.options.onUpdateMessage(
-      parseSessionNotification({
-        sessionId,
-        update: {
-          sessionUpdate: 'plan_update',
-          plan: {
-            type: 'markdown',
-            planId: turnId,
-            content: parsed.data.plan,
-          },
-        },
-      })
-    );
-
-    // Create a permission request and wait for user approval.
-    const requestId = randomUUID();
-    const permissionRequest: acp.RequestPermissionRequest = {
-      sessionId,
-      toolCall: {
-        toolCallId,
-        title: 'Approve plan',
-        kind: 'switch_mode',
-        content: [{ type: 'content', content: { type: 'text', text: parsed.data.plan } }],
-      },
-      options: [
-        { optionId: 'accept', name: 'Accept', kind: 'allow_once' },
-        { optionId: 'reject', name: 'Reject', kind: 'reject_once' },
-      ],
-    };
-
-    this.logger.debug(
-      `[${this.options.sessionId}] Requesting permission for cursor/create_plan (toolCallId=${toolCallId})`
-    );
-
-    const response = await this.options.onRequestPermission(requestId, permissionRequest);
-
-    // Map the permission outcome to cursor's expected format.
-    // 'selected' with optionId 'accept' maps to 'accepted'.
-    // 'selected' with any other optionId or 'cancelled' maps to 'cancelled'.
-    if (
-      response.outcome.outcome === 'selected' &&
-      'optionId' in response.outcome &&
-      response.outcome.optionId === 'accept'
-    ) {
-      return { outcome: { outcome: 'accepted' } };
-    }
-    return { outcome: { outcome: 'cancelled' } };
   }
 
   private async handleExtensionMessage(
@@ -1536,6 +1450,11 @@ export class AgentClient implements acp.Client {
           this.tryHandleKimiTaskLifecycleExtension(logicalMethod, event.params);
         }
         return;
+      case 'cursorPlanApprovalInvalid':
+        this.logger.warn(
+          `[${this.options.sessionId}] Invalid cursor/create_plan params: ${event.error}`
+        );
+        return { outcome: { outcome: 'cancelled' } };
       case 'cursorPlanApproval': {
         // cursor/create_plan is a blocking extension: emit the plan for rendering,
         // then request a switch_mode approval so the user can accept or reject.
@@ -1572,7 +1491,17 @@ export class AgentClient implements acp.Client {
           ],
         };
         const response = await this.options.onRequestPermission(requestId, syntheticRequest);
-        return { outcome: response.outcome };
+        // Map the permission outcome to cursor's expected format.
+        // 'selected' with optionId 'accept' maps to 'accepted'.
+        // 'selected' with any other optionId or 'cancelled' maps to 'cancelled'.
+        if (
+          response.outcome.outcome === 'selected' &&
+          'optionId' in response.outcome &&
+          response.outcome.optionId === 'accept'
+        ) {
+          return { outcome: { outcome: 'accepted' } };
+        }
+        return { outcome: { outcome: 'cancelled' } };
       }
     }
   }

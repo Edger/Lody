@@ -124,6 +124,10 @@ export type LodyExtensionEvent =
       readonly sessionId: string;
       readonly toolCallId: string;
       readonly plan: string;
+    }
+  | {
+      readonly type: 'cursorPlanApprovalInvalid';
+      readonly error: string;
     };
 
 export function parseLodyExtensionCapabilities(
@@ -225,7 +229,10 @@ export function parseLodyExtensionMessage(args: {
         plan: parsed.data.plan,
       };
     }
-    return null;
+    // The method is recognized but the payload is malformed: surface an explicit
+    // invalid event so the blocking caller can answer cursor-agent with a
+    // cancelled outcome instead of an empty response.
+    return { type: 'cursorPlanApprovalInvalid', error: parsed.error.message };
   }
 
   return null;
