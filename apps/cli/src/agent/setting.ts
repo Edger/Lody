@@ -1,10 +1,12 @@
 import { existsSync } from 'node:fs';
+import { createHash } from 'node:crypto';
 import { homedir } from 'node:os';
 import { delimiter, dirname, join, normalize, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import {
   type AgentConfigCliType,
+  DEEPSEEK_HARNESS_BASE_URL_ENV,
   type BuiltinRuntimeOverrides,
   type CliType,
   type CustomAcpLaunchSpec,
@@ -64,6 +66,8 @@ export type ResolveACPSettingInput = {
    */
   customAcp?: CustomAcpLaunchSpec;
   runtimeOverrides?: BuiltinRuntimeOverrides;
+  /** Environment values that can alter an agent's advertised capabilities. */
+  env?: NodeJS.ProcessEnv;
 };
 
 export type ResolvedACPSetting = {
@@ -143,6 +147,13 @@ export const BuiltinACPSetting: Record<CliType, ACPSetting> = {
   },
 };
 
+/**
+ * Capability-cache source version for Bub. Bub is a user-installed CLI
+ * (`bub acp`) that Lody does not manage or version; the static key keeps
+ * a capability probe valid until the next explicit refresh.
+ */
+const BUILTIN_BUB_CAPABILITY_SOURCE_VERSION = 'builtin-bub:acp';
+
 // Serve npx launches from the local cache when the package is already
 // installed; go to the registry only on a cache miss. Registry agent specs are
 // exact-version pinned, so a cache hit is immutable and integrity-checked —
@@ -218,7 +229,15 @@ export function getAcpCapabilitySourceVersion(
           : `${BUILTIN_GROK_CAPABILITY_SOURCE_VERSION}${runtimeOverrideSuffix}`;
       }
       if (input.agentType === 'deepseek') {
-        return DEEPSEEK_HARNESS_CAPABILITY_SOURCE_VERSION;
+        const baseUrl = input.env?.[DEEPSEEK_HARNESS_BASE_URL_ENV];
+        return baseUrl?.trim()
+          ? `${DEEPSEEK_HARNESS_CAPABILITY_SOURCE_VERSION}+endpoint:${createHash('sha256').update(baseUrl).digest('hex').slice(0, 12)}`
+          : DEEPSEEK_HARNESS_CAPABILITY_SOURCE_VERSION;
+      }
+      if (input.agentType === 'bub') {
+        // Bub is a user-installed CLI whose version Lody does not own, so the
+        // cache key is static. A manual refresh re-probes after an upgrade.
+        return BUILTIN_BUB_CAPABILITY_SOURCE_VERSION;
       }
     }
     return `builtin:${input.agentType}:unknown`;
@@ -305,10 +324,13 @@ export function resolveCustomACPSetting(
   agentType: string,
   customAcp: CustomAcpLaunchSpec | undefined
 ): ResolvedACPSetting {
-  const command = customAcp?.command.trim();
-  if (!command) {
+  const configured = customAcp?.command.trim();
+  if (!configured) {
     throw new Error(`Custom ACP ${agentType} has no launch command configured`);
   }
+  // The launch command is typed by a human, so it can start with `~`. spawn()
+  // does not expand it and the agent would fail to start with ENOENT.
+  const command = expandHomePath(configured);
   return {
     status: { agent: `custom:${agentType}`, command },
     exec: { command, args: [...(customAcp?.args ?? [])] },
@@ -388,6 +410,18 @@ async function resolveBuiltinACPProcessLaunch(
     });
     return {
       ...launch,
+      capabilitySourceVersion: getAcpCapabilitySourceVersion(input),
+    };
+  }
+  if (input.agentType === 'bub') {
+    // Bub ships its own `bub acp` ACP server and is installed by the user
+    // (`bub install bub-acp-server`). Lody neither downloads nor versions it;
+    // when the command is missing the spawn fails and the UI points at the
+    // install guide. `bub` is resolved from the same augmented PATH as other
+    // user-installed local ACP agents.
+    return {
+      command: 'bub',
+      args: ['acp', ...(input.extraArgs ?? [])],
       capabilitySourceVersion: getAcpCapabilitySourceVersion(input),
     };
   }

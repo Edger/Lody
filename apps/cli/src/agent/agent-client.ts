@@ -1,3 +1,4 @@
+import type { LodyWorktreeProject } from 'acp-extension-core';
 import { randomUUID } from 'crypto';
 import { promises as fs } from 'fs';
 import path from 'path';
@@ -10,7 +11,7 @@ import {
   LODY_TOOL_NAMES,
   type LodyExtensionCapabilities,
   type LodyElicitationMeta,
-  type LodySubagentTask,
+  type LodyGoalCapability,
   type RateLimit,
   type RateLimitsGetRequest,
   type RateLimitsSnapshot,
@@ -23,10 +24,11 @@ import {
   type AcpConfigOptionValue,
   type AcpSessionNotification,
   type AgentConfigCliType,
+  type SessionGoalAction,
   type SessionGoalContent,
   type SessionTurnInputConfig,
   sanitizeGoalObjective,
-  usesAcpProvidedSessionTitle,
+  trustsUntaggedAcpSessionTitle,
   parseSessionNotification,
   SessionContextWindowUsage,
   SessionId,
@@ -36,11 +38,13 @@ import {
   buildAskUserQuestionElicitationResponse,
   formatMcpResolutionProblem,
   getServerNow,
+  ACP_INIT_TIMEOUT_MS as DEFAULT_ACP_INIT_TIMEOUT_MS,
+  ACP_NEW_SESSION_TIMEOUT_MS as DEFAULT_ACP_NEW_SESSION_TIMEOUT_MS,
 } from '@lody/shared';
 import { getLocalControlSocketPath } from '@lody/shared/node/local-ipc';
 import { getLodyMcpHttpEndpoint } from '@/mcp/lody-mcp-http-server';
 import { buildLodyMcpHttpHeaders } from '@/mcp/lody-mcp-http-protocol';
-import { TerminalManager } from '@/session/terminal-manager';
+import { TerminalManager, TerminalSpawnError } from '@/session/terminal-manager';
 import { reportError } from 'src/utils/telemetry';
 import { formatErrorMessage } from '@/utils/format-error';
 import { LODY_AUTH_SITE_URL, LODY_AUTH_URL, LODY_SERVER_URL } from '@/utils/const';
@@ -73,10 +77,18 @@ import {
 } from './acknowledged-steer';
 import type { SessionMcpCatalogSelector } from './session-mcp-resolver';
 import {
+  getBuiltinToolPermissionOutcome,
   parseLodyExtensionCapabilities,
   parseLodyExtensionMessage,
   parseRateLimitsSnapshot,
 } from './lody-acp-extension';
+import {
+  buildGoalPromptMeta,
+  buildGoalSlashCommandText,
+  resolveGoalActionTransport,
+  type GoalActionTransport,
+  type GoalPromptControl,
+} from './goal-control';
 
 /**
  * Checks if an error is a transport-related error that may be transient.
@@ -290,23 +302,6 @@ function withAbort<T>(promise: Promise<T>, abortPromise?: Promise<never>): Promi
   return Promise.race([promise, abortPromise]);
 }
 
-type SessionModelUsage = NonNullable<SessionUsageUpdate['modelUsage']>[string];
-
-const toModelUsageFromUsage = (usage: SessionUsageUpdate['usage']): SessionModelUsage => {
-  const rawCostUSD = (usage as { costUSD?: unknown }).costUSD;
-  const costUSD =
-    typeof rawCostUSD === 'number' && Number.isFinite(rawCostUSD) ? rawCostUSD : undefined;
-
-  return {
-    inputTokens: usage.inputTokens,
-    outputTokens: usage.outputTokens,
-    cacheReadInputTokens: usage.cacheReadInputTokens,
-    cacheCreationInputTokens: usage.cacheCreationInputTokens,
-    reasoningOutputTokens: usage.reasoningOutputTokens,
-    costUSD,
-  };
-};
-
 const sanitizeModelUsage = (
   modelUsage: SessionUsageUpdate['modelUsage']
 ): SessionUsageUpdate['modelUsage'] => {
@@ -416,26 +411,20 @@ export type AgentSessionWarning = {
   source?: string;
 };
 
-const LodySubagentTaskSchema = z.object({
-  taskId: z.string().min(1),
-  description: z.string(),
-  status: z.enum(['running', 'completed', 'failed', 'timed_out', 'killed', 'lost']),
-  agentId: z.string().optional(),
-  subagentType: z.string().optional(),
-  modelId: z.string().optional(),
-  thinkingEffort: z.string().optional(),
-  startedAtEpochSeconds: z.number(),
-  endedAtEpochSeconds: z.number().nullable(),
-  stopReason: z.string().optional(),
-});
-
 export type SteerApplicationLease = {
   release: () => void;
 };
 
+export type SteerOutcome = 'applied' | 'not-applied' | 'unknown';
+
+export type SteerOutcomeResult =
+  | { outcome: 'applied'; application: SteerApplicationLease }
+  | { outcome: 'not-applied'; error: unknown }
+  | { outcome: 'unknown'; error: unknown };
+
 export type SteerPromptRun = {
   completion: Promise<acp.PromptResponse | undefined>;
-  applied: Promise<SteerApplicationLease>;
+  outcome: Promise<SteerOutcomeResult>;
 };
 
 type SteerApplicationWaiter = {
@@ -571,6 +560,8 @@ function extractImageGenerationContentFields(content: unknown): {
  * Synchronous: everything that needs I/O already happened in the load phase.
  */
 export interface AgentClientOptions {
+  /** Resolve logical project identity only after worktreeProject capability negotiation. */
+  resolveWorktreeProject?: () => Promise<LodyWorktreeProject>;
   sessionId: SessionId;
   workspaceId?: WorkspaceId;
   machineId?: MachineId;
@@ -597,7 +588,7 @@ export interface AgentClientOptions {
     requestId: string,
     request: acp.RequestPermissionRequest
   ): Promise<acp.RequestPermissionResponse>;
-  onUsageUpdate?(usage: SessionUsageUpdate): void;
+  onUsageUpdate?(usage: SessionUsageUpdate, accountingId?: string): void;
   onContextWindowUsageUpdate?(usage: SessionContextWindowUsage): void;
   onRateLimitUpdate?(limits: RateLimit): void;
   onThreadGoalUpdated?(goal: SessionGoalContent): void;
@@ -635,16 +626,19 @@ export class AgentClient implements acp.Client {
   private supportsFork = false;
   private supportsForkAtTurn = false;
   private lodyExtensionCapabilities: LodyExtensionCapabilities = {};
+  private worktreeProject?: LodyWorktreeProject;
   private authMethods: acp.AuthMethod[] = [];
   private authenticationRequired = false;
   private acknowledgedSteerCapability: AcknowledgedSteerCapability | null = null;
   private readonly steerApplicationWaiters = new Map<string, SteerApplicationWaiter>();
   private steerApplicationBarrier: Promise<void> | null = null;
   private activePromptCompletion: ActivePromptCompletion | null = null;
+  private readonly pendingPrompts = new Set<Promise<unknown>>();
   private sessionWorkdir: string | null = null;
   private agentMcpCapabilities: acp.McpCapabilities | undefined;
   /** Session config options returned by the agent; the source of model/mode choices and names. */
   private configOptions: acp.SessionConfigOption[] = [];
+  private readonly configOptionsListeners = new Set<() => void>();
   /** Desired config retained across same-client replacement sessions. */
   private readonly configOptionValues: NonNullable<SessionTurnInputConfig['configOptionValues']>;
   /** Legacy top-level `models` state proves that `session/set_model` is supported. */
@@ -1269,19 +1263,29 @@ export class AgentClient implements acp.Client {
         return acc;
       }, {}) ?? undefined;
 
-    const terminalId = await this.terminalManager.createTerminal(
-      params.sessionId,
-      params.command,
-      params.args ?? [],
-      params.cwd ?? undefined,
-      env,
-      typeof params.outputByteLimit === 'bigint'
-        ? params.outputByteLimit > BigInt(Number.MAX_SAFE_INTEGER)
-          ? Number.MAX_SAFE_INTEGER
-          : Number(params.outputByteLimit)
-        : (params.outputByteLimit ?? undefined)
-    );
-    return { terminalId };
+    try {
+      const terminalId = await this.terminalManager.createTerminal(
+        params.sessionId,
+        params.command,
+        params.args ?? [],
+        params.cwd ?? undefined,
+        env,
+        typeof params.outputByteLimit === 'bigint'
+          ? params.outputByteLimit > BigInt(Number.MAX_SAFE_INTEGER)
+            ? Number.MAX_SAFE_INTEGER
+            : Number(params.outputByteLimit)
+          : (params.outputByteLimit ?? undefined)
+      );
+      return { terminalId };
+    } catch (error) {
+      if (error instanceof TerminalSpawnError) {
+        // An unusable command is a bad request, not a transport failure: answer
+        // with a JSON-RPC code the agent can classify. A raw errno (`-2`) is
+        // untyped on the wire and some agents abandon the ACP session over it.
+        throw acp.RequestError.invalidParams({ details: error.message }, error.message);
+      }
+      throw error;
+    }
   }
   async terminalOutput?(params: acp.TerminalOutputRequest): Promise<acp.TerminalOutputResponse> {
     this.ensureSessionMatch(params.sessionId as ACPSessionId);
@@ -1330,39 +1334,8 @@ export class AgentClient implements acp.Client {
     return parseRateLimitsSnapshot(response);
   }
 
-  async listSubagents(activeOnly = false): Promise<readonly LodySubagentTask[]> {
-    const result = await this.requestSubagentExtension<{ tasks?: unknown }>(
-      LODY_EXTENSION_METHODS.subagentsList,
-      { activeOnly }
-    );
-    return z.array(LodySubagentTaskSchema).parse(result.tasks);
-  }
-
   async cancelSubagent(taskId: string, reason?: string): Promise<void> {
-    await this.requestSubagentExtension(LODY_EXTENSION_METHODS.subagentsCancel, {
-      taskId,
-      reason,
-    });
-  }
-
-  async getSubagentOutput(taskId: string, tail?: number): Promise<string> {
-    const result = await this.requestSubagentExtension<{ output?: unknown }>(
-      LODY_EXTENSION_METHODS.subagentsOutput,
-      { taskId, tail }
-    );
-    return z.string().parse(result.output);
-  }
-
-  private async requestSubagentExtension<T extends Record<string, unknown>>(
-    method: string,
-    params: Record<string, unknown>
-  ): Promise<T> {
-    const subagents = this.lodyExtensionCapabilities.subagents;
-    const supported =
-      (method === LODY_EXTENSION_METHODS.subagentsList && subagents?.list === true) ||
-      (method === LODY_EXTENSION_METHODS.subagentsCancel && subagents?.cancel === true) ||
-      (method === LODY_EXTENSION_METHODS.subagentsOutput && subagents?.output === true);
-    if (!supported) {
+    if (this.lodyExtensionCapabilities.subagents?.cancel !== true) {
       throw new Error('[ACP_SUBAGENT_UNSUPPORTED] Agent did not advertise subagent management');
     }
     const sessionId = this.acpSessionId;
@@ -1370,8 +1343,84 @@ export class AgentClient implements acp.Client {
     if (!sessionId || !connection) {
       throw new Error('[ACP_SUBAGENT_UNAVAILABLE] ACP session is not connected');
     }
-    return connection.request<T, Record<string, unknown>>(method, { sessionId, ...params });
+    await connection.request(LODY_EXTENSION_METHODS.subagentsCancel, { sessionId, taskId, reason });
   }
+
+  getGoalCapability(): LodyGoalCapability | undefined {
+    return this.lodyExtensionCapabilities.goal;
+  }
+
+  resolveGoalActionTransport(action: SessionGoalAction): GoalActionTransport | null {
+    return resolveGoalActionTransport(this.lodyExtensionCapabilities.goal, action);
+  }
+
+  /**
+   * Move durable goal state without a turn.
+   *
+   * An active goal holds this session's single ACP prompt open across the
+   * agent's own continuations, so a pause or clear that had to wait for a free
+   * prompt slot would wait for the very thing it is trying to stop. The agent
+   * publishes the resulting snapshot on its own session update; this response is
+   * only the acknowledgement that the action landed.
+   */
+  async controlGoal(action: SessionGoalAction): Promise<void> {
+    if (this.resolveGoalActionTransport(action) !== 'request') {
+      throw new Error(
+        `[ACP_GOAL_UNSUPPORTED] Agent did not advertise out-of-band goal control for ${action}`
+      );
+    }
+    const sessionId = this.acpSessionId;
+    const connection = this.connection;
+    if (!sessionId || !connection) {
+      throw new Error('[ACP_GOAL_UNAVAILABLE] ACP session is not connected');
+    }
+    const response = await connection.request<unknown, { sessionId: string; action: string }>(
+      LODY_EXTENSION_METHODS.sessionGoal,
+      { sessionId, action }
+    );
+    const parsed = z
+      .object({ goal: LodyGoalSnapshotSchema.nullable().optional() })
+      .safeParse(response);
+    if (!parsed.success) {
+      throw new Error(
+        `[ACP_GOAL_INVALID_RESPONSE] Agent returned an invalid goal control response: ${parsed.error.message}`
+      );
+    }
+    this.logger.debug(
+      `[${this.options.sessionId}] Goal ${action} applied (status=${parsed.data.goal?.status ?? 'none'})`
+    );
+  }
+
+  /**
+   * Shape a prompt that carries a goal action.
+   *
+   * Metadata keeps the action off the transcript. A runtime that never
+   * advertised the metadata transport would ignore it and run the fallback
+   * blocks as an ordinary message, so those runtimes get the slash bridge that
+   * they do understand.
+   */
+  private buildGoalControlPrompt(
+    prompt: acp.ContentBlock[],
+    control: GoalPromptControl
+  ): { prompt: acp.ContentBlock[]; _meta?: acp.PromptRequest['_meta'] } {
+    // This path already owns a prompt (including cold-session restoration).
+    // Prefer the advertised prompt transport, not a live-session request.
+    const transport = resolveGoalActionTransport(
+      this.lodyExtensionCapabilities.goal,
+      control.action,
+      'prompt'
+    );
+    if (transport === 'promptMeta') {
+      return { prompt, _meta: buildGoalPromptMeta(control) };
+    }
+    if (transport === 'slashCommand') {
+      return { prompt: [{ type: 'text', text: buildGoalSlashCommandText(control) }] };
+    }
+    throw new Error(
+      `[ACP_GOAL_UNSUPPORTED] Agent cannot run goal action ${control.action} inside a prompt`
+    );
+  }
+
   async extMethod(
     method: string,
     params: Record<string, unknown>
@@ -1413,11 +1462,15 @@ export class AgentClient implements acp.Client {
     }
     switch (event.type) {
       case 'usage': {
-        const modelUsage =
-          event.update.modelUsage == null && this.currentModel
-            ? { [this.currentModel.modelId]: toModelUsageFromUsage(event.update.usage) }
-            : sanitizeModelUsage(event.update.modelUsage);
-        this.options.onUsageUpdate?.({ ...event.update, modelUsage });
+        // Never invent a model from the UI selection. Legacy adapters without
+        // modelUsage stay unattributed/skipped instead of being misattributed.
+        this.options.onUsageUpdate?.(
+          {
+            ...event.update,
+            modelUsage: sanitizeModelUsage(event.update.modelUsage),
+          },
+          event.accountingId
+        );
         return;
       }
       case 'rateLimits':
@@ -1593,7 +1646,7 @@ export class AgentClient implements acp.Client {
       return;
     }
 
-    const ownsTitleGeneration = usesAcpProvidedSessionTitle(
+    const trustsUntaggedTitle = trustsUntaggedAcpSessionTitle(
       this.options.agentConfig?.cliType,
       this.options.agentConfig?.agentType
     );
@@ -1607,7 +1660,7 @@ export class AgentClient implements acp.Client {
       (lodyTitleMeta.success && lodyTitleMeta.data.titleSource === 'explicit') ||
       (legacyCodexTitleMeta?.success === true &&
         legacyCodexTitleMeta.data.titleSource === 'explicit');
-    if (!ownsTitleGeneration && !isExplicitProviderTitle) {
+    if (!trustsUntaggedTitle && !isExplicitProviderTitle) {
       return;
     }
 
@@ -1633,6 +1686,7 @@ export class AgentClient implements acp.Client {
   private getSessionStartMeta(forkSessionTurnId?: string) {
     const clientIdentifier = this.getGrokClientIdentifier();
     const lody = {
+      ...(this.worktreeProject ? { worktreeProject: this.worktreeProject } : {}),
       ...(forkSessionTurnId !== undefined
         ? { forkAtTurn: { version: 1 as const, turnId: forkSessionTurnId } }
         : {}),
@@ -1703,6 +1757,7 @@ export class AgentClient implements acp.Client {
     } else {
       this.currentModel = undefined;
     }
+    for (const listener of this.configOptionsListeners) listener();
   }
 
   private retainLegacyConfigOptionValue(configId: string, value: AcpConfigOptionValue): void {
@@ -1717,6 +1772,7 @@ export class AgentClient implements acp.Client {
       }
       return option;
     });
+    for (const listener of this.configOptionsListeners) listener();
   }
 
   async startSession(
@@ -1732,7 +1788,7 @@ export class AgentClient implements acp.Client {
     const connection = new acp.ClientSideConnection(() => this, stream);
     this.connection = connection;
     const grokClientIdentifier = this.getGrokClientIdentifier();
-    const sessionStartMeta = this.getSessionStartMeta();
+    this.worktreeProject = undefined;
     this.logger.debug(
       `[${this.options.sessionId}] Starting ACP client (workdir=${workdir} resumeSessionId=${
         resumeSessionId ?? 'none'
@@ -1773,7 +1829,10 @@ export class AgentClient implements acp.Client {
     // connection.initialize() internally spawns the CLI process and waits for it to respond.
     // Missing dependencies or local runtime issues can hang this operation indefinitely.
     // Apply a hard timeout so startup fails fast.
-    const ACP_INIT_TIMEOUT_MS = Math.max(0, timeoutOptions.initTimeoutMs ?? 120_000); // 2 minutes default
+    const ACP_INIT_TIMEOUT_MS = Math.max(
+      0,
+      timeoutOptions.initTimeoutMs ?? DEFAULT_ACP_INIT_TIMEOUT_MS
+    );
 
     let initResponse: acp.InitializeResponse;
     try {
@@ -1874,6 +1933,14 @@ export class AgentClient implements acp.Client {
       workdir = target.workdir;
       resumeSessionId = target.resumeSessionId;
     }
+
+    if (
+      this.lodyExtensionCapabilities.worktreeProject?.version === 1 &&
+      this.options.resolveWorktreeProject
+    ) {
+      this.worktreeProject = await withAbort(this.options.resolveWorktreeProject(), startupAbort);
+    }
+    const sessionStartMeta = this.getSessionStartMeta();
 
     this.logger.debug(`[${this.options.sessionId}] About to establish ACP session`);
     const newSessionStart = performance.now();
@@ -2122,7 +2189,10 @@ export class AgentClient implements acp.Client {
       // 2. Start the internal query system which spawns another subprocess
       // 3. Call query.supportedModels() and query.supportedCommands()
       // Any of these can hang due to runtime/environment issues. Apply a hard timeout.
-      const ACP_NEW_SESSION_TIMEOUT_MS = Math.max(0, timeoutOptions.newSessionTimeoutMs ?? 120_000); // 2 minutes default
+      const ACP_NEW_SESSION_TIMEOUT_MS = Math.max(
+        0,
+        timeoutOptions.newSessionTimeoutMs ?? DEFAULT_ACP_NEW_SESSION_TIMEOUT_MS
+      );
 
       try {
         sessionResponse = await withTimeout(
@@ -2349,7 +2419,14 @@ export class AgentClient implements acp.Client {
           : new Error(`Steer ${steerId} completed before application`)
       );
     });
-    return { completion, applied };
+    const outcome: Promise<SteerOutcomeResult> = applied.then(
+      (application) => ({ outcome: 'applied', application }),
+      (error: unknown) => ({
+        outcome: error instanceof AgentSteerNotDeliveredError ? 'not-applied' : 'unknown',
+        error,
+      })
+    );
+    return { completion, outcome };
   }
 
   private async requestSteeringExtension(
@@ -2377,6 +2454,7 @@ export class AgentClient implements acp.Client {
           steerId: string;
         }
       >(method, { sessionId, prompt, steerId });
+      this.trackPendingExecution(request);
     } catch (error) {
       // Nothing was written to the agent, so the prompt is provably still ours.
       throw new AgentSteerNotDeliveredError(
@@ -2405,9 +2483,14 @@ export class AgentClient implements acp.Client {
             )
           : error;
       });
-      const parsed = z.object({ outcome: z.literal('injected') }).safeParse(response);
+      const parsed = z.object({ outcome: z.enum(['injected', 'failed']) }).safeParse(response);
       if (!parsed.success) {
         throw new Error(`Agent returned an invalid acknowledged steer response for ${method}`);
+      }
+      if (parsed.data.outcome === 'failed') {
+        throw new AgentSteerNotDeliveredError(
+          `Agent reported that acknowledged steer ${steerId} was not applied`
+        );
       }
     } finally {
       if (signal && abortListener) {
@@ -2416,15 +2499,46 @@ export class AgentClient implements acp.Client {
     }
   }
 
+  /** Raw prompts and steer submissions remain owned after their local waits end. */
+  get pendingPromptCompletion(): Promise<void> | null {
+    return this.pendingPrompts.size > 0
+      ? Promise.allSettled([...this.pendingPrompts]).then(() => undefined)
+      : null;
+  }
+
+  private trackPendingExecution(request: Promise<unknown>): void {
+    this.pendingPrompts.add(request);
+    const release = () => {
+      this.pendingPrompts.delete(request);
+    };
+    void request.then(release, release);
+  }
+
   async prompt(
     sessionId: ACPSessionId,
     prompt: acp.ContentBlock[],
-    options?: { signal?: AbortSignal; _meta?: acp.PromptRequest['_meta'] }
+    options?: {
+      signal?: AbortSignal;
+      _meta?: acp.PromptRequest['_meta'];
+      /**
+       * Run a goal action inside this prompt. The action travels as metadata so
+       * the conversation never carries command text; runtimes that predate that
+       * capability get the `/goal …` bridge instead.
+       */
+      goalControl?: GoalPromptControl;
+    }
   ) {
+    const goalPrompt = options?.goalControl
+      ? this.buildGoalControlPrompt(prompt, options.goalControl)
+      : null;
+    if (goalPrompt) {
+      prompt = goalPrompt.prompt;
+    }
     const span = startTraceSpan(this.logger, 'agent_client.prompt', {
       sessionId: this.options.sessionId,
       acpSessionId: sessionId,
       promptBlocks: prompt.length,
+      ...(options?.goalControl ? { goalAction: options.goalControl.action } : {}),
     });
     this.logger.debug(
       `[${this.options.sessionId}] AgentClient.prompt called (acpSessionId=${sessionId})`
@@ -2438,10 +2552,11 @@ export class AgentClient implements acp.Client {
       this.logger.debug(
         `[${this.options.sessionId}] Session match verified, calling connection.prompt`
       );
+      const promptMeta = goalPrompt?._meta ?? options?._meta;
       const promptPromise = this.connection?.prompt({
         sessionId,
         prompt,
-        ...(options?._meta ? { _meta: options._meta } : {}),
+        ...(promptMeta ? { _meta: promptMeta } : {}),
       });
       if (!promptPromise) {
         this.logger.error(
@@ -2450,6 +2565,10 @@ export class AgentClient implements acp.Client {
         span.end({ outcome: 'undefined-promise' });
         return undefined;
       }
+
+      // A local abort does not finish the remote request. Track every raw
+      // request, including overlapping prompts used by acknowledged handoff.
+      this.trackPendingExecution(promptPromise);
 
       let abortListener: (() => void) | undefined;
       let trackedPromptCompletion: ActivePromptCompletion | undefined;
@@ -2604,6 +2723,26 @@ export class AgentClient implements acp.Client {
   /** Returns the config options currently known for this session. */
   getConfigOptions(): acp.SessionConfigOption[] {
     return this.configOptions;
+  }
+
+  subscribeConfigOptions(listener: () => void): () => void {
+    this.configOptionsListeners.add(listener);
+    return () => {
+      this.configOptionsListeners.delete(listener);
+    };
+  }
+
+  getAutomaticToolPermissionOutcome(
+    request: acp.RequestPermissionRequest,
+    pending: boolean
+  ): acp.RequestPermissionResponse['outcome'] | undefined {
+    if (request.sessionId !== this.acpSessionId) return undefined;
+    return getBuiltinToolPermissionOutcome({
+      agentConfig: this.options.agentConfig,
+      configOptions: this.configOptions,
+      request,
+      pending,
+    });
   }
 
   /**

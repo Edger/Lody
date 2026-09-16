@@ -1,7 +1,8 @@
 import { useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { FREE_SESSION_LIMIT_PER_WORKSPACE, FREE_WORKSPACE_MEMBER_LIMIT } from '@lody/shared';
-import { ArrowLeftRight, Check, Loader2 } from 'lucide-react';
+import { ArrowLeftRight, Check } from 'lucide-react';
+import { Spinner } from '@/ui/spinner';
 import { Badge, Button, Card, Input } from '@/ui';
 import { Progress } from '@/ui/progress';
 import { Skeleton } from '@/ui/skeleton';
@@ -12,7 +13,7 @@ import { SubscribeConsentNotice } from '../shared/subscribe-consent-notice';
 import { settingContainerClass } from '.';
 
 export type BillingInterval = 'month' | 'year';
-export type BillingPendingAction = 'checkout' | null;
+export type BillingPendingAction = 'checkout' | 'portal' | null;
 
 export interface BillingOverviewData {
   billingAccountId: string | null;
@@ -122,6 +123,8 @@ export interface BillingSettingsViewProps {
   onSwitchInterval: () => void;
   /** Interval switch request in flight. */
   switchIntervalPending: boolean;
+  /** Opens the Stripe payment-method-only Portal. */
+  onPaymentMethod?: () => void;
   /** Opens the cancel-at-period-end confirmation dialog (container-owned). */
   onCancelSubscription: () => void;
   /** Undoes a scheduled cancel-at-period-end. */
@@ -170,6 +173,7 @@ export function BillingSettingsView({
   onUpgrade,
   onSwitchInterval,
   switchIntervalPending,
+  onPaymentMethod,
   onCancelSubscription,
   onResumeSubscription,
   onRedeemCode,
@@ -282,7 +286,7 @@ export function BillingSettingsView({
       {/* Desktop: checkout opened in the system browser, awaiting payment */}
       {externalCheckoutPending ? (
         <Card className="flex items-start gap-3 border-primary/30 bg-primary/5 p-4">
-          <Loader2 className="mt-0.5 h-4 w-4 shrink-0 animate-spin text-primary" />
+          <Spinner className="mt-0.5 h-4 w-4 shrink-0 text-primary" />
           <div className="min-w-0 flex-1">
             <p className="text-sm font-medium text-foreground">
               {canScheduleAfterGift || overview.subscriptionSetupPending
@@ -306,7 +310,7 @@ export function BillingSettingsView({
       {/* Payment received, activation in flight */}
       {paymentProcessing && !externalCheckoutPending ? (
         <Card className="flex items-start gap-3 border-primary/30 bg-primary/5 p-4">
-          <Loader2 className="mt-0.5 h-4 w-4 shrink-0 animate-spin text-primary" />
+          <Spinner className="mt-0.5 h-4 w-4 shrink-0 text-primary" />
           <div className="min-w-0">
             <p className="text-sm font-medium text-foreground">
               {overview.subscriptionSetupPending
@@ -353,7 +357,7 @@ export function BillingSettingsView({
                   className="inline-flex items-center gap-1 font-medium text-primary transition-colors hover:text-primary/80 disabled:opacity-60"
                 >
                   {switchIntervalPending ? (
-                    <Loader2 className="h-3 w-3 animate-spin" />
+                    <Spinner className="h-3 w-3" />
                   ) : (
                     <ArrowLeftRight className="h-3 w-3" />
                   )}
@@ -543,9 +547,7 @@ export function BillingSettingsView({
                   }
                   onClick={onUpgrade}
                 >
-                  {pendingAction === 'checkout' ? (
-                    <Loader2 className="h-4 w-4 animate-spin" />
-                  ) : null}
+                  {pendingAction === 'checkout' ? <Spinner className="h-4 w-4" /> : null}
                   {yearlyEarlyBirdSelected
                     ? overview.yearlyEarlyBirdEligible
                       ? t('billing.subscribeLockedEarlyBird')
@@ -614,7 +616,7 @@ export function BillingSettingsView({
               disabled={redeemPending || checkoutInProgress || !code.trim()}
               onClick={() => onRedeemCode(code.trim())}
             >
-              {redeemPending ? <Loader2 className="h-4 w-4 animate-spin" /> : null}
+              {redeemPending ? <Spinner className="h-4 w-4" /> : null}
               {t('billing.redeemApply')}
             </Button>
           </div>
@@ -717,7 +719,7 @@ export function BillingSettingsView({
               </div>
             ) : invoices === undefined ? (
               <div className="flex items-center gap-2 text-sm text-muted-foreground">
-                <Loader2 className="h-4 w-4 animate-spin" />
+                <Spinner className="h-4 w-4" />
                 {t('billing.historyLoading')}
               </div>
             ) : invoices.length === 0 ? (
@@ -777,6 +779,39 @@ export function BillingSettingsView({
         </Card>
       ) : null}
 
+      {canManage &&
+      overview.billingAccountId &&
+      ['stripe', 'stripe_gift'].includes(overview.entitlementSource) &&
+      onPaymentMethod ? (
+        <Card className="flex flex-wrap items-center justify-between gap-3 p-4">
+          <div>
+            <p className="text-sm font-medium">{t('billing.paymentMethod')}</p>
+            <p className="mt-1 text-xs text-muted-foreground">
+              {t('billing.paymentMethodDescription')}
+            </p>
+          </div>
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={onPaymentMethod}
+            disabled={
+              pendingAction !== null ||
+              cancelPending ||
+              switchIntervalPending ||
+              redeemPending ||
+              checkoutInProgress
+            }
+          >
+            {pendingAction === 'portal' ? <Spinner className="mr-1.5 h-3 w-3" /> : null}
+            {t(
+              pendingAction === 'portal'
+                ? 'billing.paymentMethodOpening'
+                : 'billing.changePaymentMethod'
+            )}
+          </Button>
+        </Card>
+      ) : null}
+
       {/* Cancel / resume subscription: deliberately low-emphasis, tucked at the
           very bottom of the billing page rather than beside the plan. */}
       {isPaid &&
@@ -792,7 +827,7 @@ export function BillingSettingsView({
               onClick={onResumeSubscription}
               className="inline-flex items-center gap-1.5 text-xs text-muted-foreground transition-colors hover:text-foreground disabled:opacity-60"
             >
-              {cancelPending ? <Loader2 className="h-3 w-3 animate-spin" /> : null}
+              {cancelPending ? <Spinner className="h-3 w-3" /> : null}
               {t('billing.resumeSubscription')}
             </button>
           ) : (
@@ -802,7 +837,7 @@ export function BillingSettingsView({
               onClick={onCancelSubscription}
               className="inline-flex items-center gap-1.5 text-xs text-muted-foreground transition-colors hover:text-destructive disabled:opacity-60"
             >
-              {cancelPending ? <Loader2 className="h-3 w-3 animate-spin" /> : null}
+              {cancelPending ? <Spinner className="h-3 w-3" /> : null}
               {t('billing.cancelSubscription')}
             </button>
           )}

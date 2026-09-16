@@ -3,12 +3,14 @@ import {
   type CSSProperties,
   type ReactNode,
   useState,
+  useContext,
   useCallback,
   useMemo,
   useLayoutEffect,
   useRef,
   memo,
 } from 'react';
+import { createPortal } from 'react-dom';
 import { createMathPlugin } from '@streamdown/math';
 import rehypeRaw from 'rehype-raw';
 import rehypeSanitize from 'rehype-sanitize';
@@ -32,13 +34,13 @@ import { useAtomValue } from 'jotai';
 import { useTranslation } from 'react-i18next';
 import { parseTaskImageMarkdownUrl } from '@lody/shared';
 import { DEFAULT_CONVERSATION_FONT_SIZE, tasksFeatureEnabledAtom } from '@/atoms/settings';
-import { FileIcon } from '@/components/icons/file-icons';
+import { MonochromeFileIcon } from '@/components/icons/file-icons';
 import {
   isMarkdownAgentFileHref,
   parseMarkdownAgentFileHref,
 } from '@/lib/markdown-agent-file-link';
 import { matchWholeFilePath, splitTextIntoFilePathSegments } from '@/lib/linkify-file-paths';
-import { remarkSingleDollarTextMath } from '@/lib/markdown-single-dollar-math';
+import { normalizeTexMathDelimiters } from '@/lib/markdown-single-dollar-math';
 import { cn } from '@/lib/utils';
 import { usePrLinkInterceptor } from './pr-link-context';
 import {
@@ -51,7 +53,11 @@ import { findSessionSearchOccurrences } from '@/lib/session-chat-search';
 import { useResolvedTheme } from '../../theme-provider';
 import type { ConversationFontSize } from '@/atoms/settings';
 import { useTaskImageUrl } from '@/hooks/use-task-image';
+import { MarkdownDiffBlock } from './markdown-diff-block';
 import { createMarkdownMermaidConfig, createMarkdownMermaidPlugin } from './markdown-mermaid';
+import { MermaidDiagramViewer } from './mermaid-diagram-viewer';
+import { MermaidFullscreenButton, useMermaidDiagramCanvas } from './use-mermaid-diagram-canvas';
+import { SessionReadonlyContext } from './session-readonly-context';
 
 export { createMarkdownMermaidConfig } from './markdown-mermaid';
 
@@ -79,6 +85,51 @@ type MdastNode = {
   children?: MdastNode[];
   url?: string;
   title?: string | null;
+  position?: {
+    start?: { offset?: number };
+    end?: { offset?: number };
+  };
+};
+
+type MdastChildReplacement = {
+  nodes: MdastNode[];
+  consumedSiblings?: number;
+};
+
+type MdastChildTransformer = (
+  child: MdastNode,
+  nextChild: MdastNode | undefined
+) => MdastChildReplacement | undefined;
+
+const transformMdastChildren = (tree: unknown, transform: MdastChildTransformer) => {
+  if (typeof tree !== 'object' || tree === null) return;
+  const root = tree as MdastNode;
+  if (typeof root.type !== 'string') return;
+
+  const walk = (node: MdastNode) => {
+    if (node.type === 'link' || node.type === 'linkReference' || node.type === 'code') return;
+
+    const children = node.children;
+    if (!Array.isArray(children) || children.length === 0) return;
+
+    const nextChildren: MdastNode[] = [];
+    for (let index = 0; index < children.length; index += 1) {
+      const child = children[index];
+      const replacement = transform(child, children[index + 1]);
+      if (replacement) {
+        nextChildren.push(...replacement.nodes);
+        index += replacement.consumedSiblings ?? 0;
+        continue;
+      }
+
+      walk(child);
+      nextChildren.push(child);
+    }
+
+    node.children = nextChildren;
+  };
+
+  walk(root);
 };
 
 // `!` prefixes are load-bearing: Streamdown wraps its output in a div with
@@ -125,6 +176,18 @@ const MARKDOWN_BASE_CLASSNAME =
   '[&_a]:underline [&_a]:underline-offset-2 [&_a]:decoration-muted-foreground/40 [&_a:hover]:decoration-muted-foreground ' +
   '[&_.katex-display]:!my-5 [&_.katex-display]:overflow-x-auto [&_.katex-display]:overflow-y-hidden [&_.katex-display]:py-1 ' +
   '[&_[data-streamdown="mermaid-block"]]:!my-5 ' +
+  // Streamdown wraps every diagram in a pan/zoom canvas that claims the gesture
+  // through inline styles: `touch-action: none` stops a finger resting on a
+  // diagram from scrolling the conversation, and its transform moves the preview
+  // inside its own frame. Panning and zooming belong to the canvas
+  // `use-mermaid-diagram-canvas.tsx` activates on the `<svg>`, so Streamdown's
+  // own transform is pinned and touch is handed back to the page. The wheel it
+  // takes from a listener is out of CSS's reach and is intercepted there too.
+  '[&_[data-streamdown="mermaid"]_[role="application"]]:!touch-auto ' +
+  '[&_[data-streamdown="mermaid"]_[role="application"]]:!transform-none ' +
+  // The cursor and the activated ring are in `tailwind/index.css` under
+  // `.markdown-renderer`, beside the rest of the diagram's frame.
+  '[&_[data-streamdown="mermaid"]]:overflow-hidden ' +
   '[&_[data-streamdown="code-block"]]:!my-4 ' +
   '[&_table]:!my-0 [&_table]:w-full [&_table]:border-collapse [&_table]:text-[0.92em] [&_table]:leading-[1.5] ' +
   '[&_th]:border-b [&_th]:border-border/70 [&_th]:bg-muted/45 [&_th]:px-2.5 [&_th]:py-1.5 [&_th]:text-left [&_th]:font-semibold [&_th]:text-foreground/80 ' +
@@ -206,12 +269,21 @@ function MarkdownExternalLink({
 
 const AUTOLINK_PATTERN = /(https?:\/\/[^\s<]+|www\.[^\s<]+)/giu;
 
+// Both autolinkers end a bare URL at whitespace, but CJK prose is written
+// without one, so `见 https://example.com/a。然后` swallows the rest of the
+// sentence into the destination. Non-ASCII punctuation and separators
+// (，。、）「」…　) never appear unencoded in a URL, so end the URL there.
+// Non-ASCII letters still may (`/wiki/中文`), and symbols are left alone
+// because they are not Markdown punctuation for strong-closer purposes.
+const NON_ASCII_URL_BOUNDARY = /(?!\p{ASCII})[\p{P}\p{Z}]/u;
+
 const countChar = (value: string, char: string) =>
   Array.from(value).reduce((count, current) => count + (current === char ? 1 : 0), 0);
 
 const splitAutolinkTrailing = (value: string) => {
-  let url = value;
-  let trailing = '';
+  const boundary = value.search(NON_ASCII_URL_BOUNDARY);
+  let url = boundary >= 0 ? value.slice(0, boundary) : value;
+  let trailing = boundary >= 0 ? value.slice(boundary) : '';
 
   while (url.length > 0) {
     const last = url[url.length - 1];
@@ -221,7 +293,7 @@ const splitAutolinkTrailing = (value: string) => {
     if (last === ']' && countChar(url, ']') <= countChar(url, '[')) break;
     if (last === '}' && countChar(url, '}') <= countChar(url, '{')) break;
 
-    if (!/[\]})"'.,:;!?，。！？；：”’»›]+/u.test(last)) break;
+    if (!/[\]})"'.,:;!?]/u.test(last)) break;
 
     trailing = `${last}${trailing}`;
     url = url.slice(0, -1);
@@ -229,6 +301,13 @@ const splitAutolinkTrailing = (value: string) => {
 
   return { url, trailing };
 };
+
+const createTextLinkNode = (url: string, text: string, title: string | null = null): MdastNode => ({
+  type: 'link',
+  url,
+  title,
+  children: [{ type: 'text', value: text }],
+});
 
 const linkifyTextValue = (value: string): MdastNode[] => {
   const result: MdastNode[] = [];
@@ -254,12 +333,7 @@ const linkifyTextValue = (value: string): MdastNode[] => {
       result.push({ type: 'text', value: rawUrl });
     } else {
       const href = url.startsWith('www.') ? `https://${url}` : url;
-      result.push({
-        type: 'link',
-        url: href,
-        title: null,
-        children: [{ type: 'text', value: url }],
-      });
+      result.push(createTextLinkNode(href, url));
 
       if (trailing.length > 0) {
         result.push({ type: 'text', value: trailing });
@@ -277,20 +351,240 @@ const linkifyTextValue = (value: string): MdastNode[] => {
   return result;
 };
 
+type MarkdownParser = {
+  parse: (value: string) => MdastNode;
+};
+
+type MarkdownFile = {
+  toString: () => string;
+};
+
+const isExactDoubleAsterisk = (value: string, offset: number) =>
+  offset >= 0 &&
+  value.slice(offset, offset + 2) === '**' &&
+  value[offset - 1] !== '*' &&
+  value[offset + 2] !== '*';
+
+const isUnescapedDoubleAsterisk = (source: string, offset: number) => {
+  if (!isExactDoubleAsterisk(source, offset)) return false;
+
+  let precedingBackslashes = 0;
+  for (let index = offset - 1; index >= 0 && source[index] === '\\'; index -= 1) {
+    precedingBackslashes += 1;
+  }
+  return precedingBackslashes % 2 === 0;
+};
+
+const isMarkdownPunctuation = (value: string) =>
+  /[!-/:-@[-`{-~]/u.test(value) || /\p{P}/u.test(value);
+
+const isValidStrongCloser = (value: string, offset: number) => {
+  if (!isExactDoubleAsterisk(value, offset)) return false;
+
+  const precedingCharacter = value[offset - 1];
+  const followingCodePoint = value.codePointAt(offset + 2);
+  const followingCharacter =
+    followingCodePoint === undefined ? undefined : String.fromCodePoint(followingCodePoint);
+  if (!precedingCharacter || /\s/u.test(precedingCharacter)) return false;
+
+  return (
+    followingCharacter === undefined ||
+    /\s/u.test(followingCharacter) ||
+    isMarkdownPunctuation(followingCharacter)
+  );
+};
+
+const findValidStrongCloser = (value: string, start = 0, end = value.length) => {
+  for (let offset = start; offset + 1 < end; offset += 1) {
+    if (isValidStrongCloser(value, offset)) return offset;
+  }
+  return -1;
+};
+
+const hasUnescapedValidCloser = (source: string, start: number, end: number) => {
+  for (let offset = start; offset + 1 < end; offset += 1) {
+    if (isUnescapedDoubleAsterisk(source, offset) && isValidStrongCloser(source, offset)) {
+      return true;
+    }
+  }
+  return false;
+};
+
+const isLiteralGfmAutolink = (source: string, link: MdastNode, linkText: MdastNode) => {
+  const linkStartOffset = link.position?.start?.offset;
+  const linkTextStartOffset = linkText.position?.start?.offset;
+  return (
+    typeof linkStartOffset === 'number' &&
+    typeof linkTextStartOffset === 'number' &&
+    linkStartOffset === linkTextStartOffset &&
+    source[linkStartOffset] !== '['
+  );
+};
+
+// The destination is the normalized form of the link text, so a tail cut from
+// the text may appear percent-encoded in the destination. Refuse the repair
+// when neither form matches rather than guess at a truncation point.
+const truncateAutolinkUrl = (url: string, tail: string) => {
+  if (url.endsWith(tail)) return url.slice(0, -tail.length);
+
+  const encodedTail = encodeURI(tail);
+  if (encodedTail !== tail && url.endsWith(encodedTail)) {
+    return url.slice(0, -encodedTail.length);
+  }
+
+  return undefined;
+};
+
+// GFM can consume a closing strong delimiter and the following inline markup
+// into an autolink. Repair that AST shape after GFM by truncating the already
+// normalized destination, while keeping ordinary URL and email autolinks.
+const remarkRepairMalformedGfmAutolinks = function (this: MarkdownParser) {
+  const parse = this.parse.bind(this);
+
+  const parseInlineSuffix = (value: string): MdastNode[] => {
+    if (!value) return [];
+
+    const parsed = parse(value);
+    const [first] = parsed.children ?? [];
+    if (parsed.children?.length === 1 && first?.type === 'paragraph' && first.children) {
+      return first.children;
+    }
+
+    return [{ type: 'text', value }];
+  };
+
+  const splitMalformedAutolink = (link: MdastNode, source: string) => {
+    if (link.type !== 'link' || typeof link.url !== 'string') return undefined;
+
+    const linkText = link.children?.[0];
+    if (linkText?.type !== 'text' || typeof linkText.value !== 'string') return undefined;
+    if (!isLiteralGfmAutolink(source, link, linkText)) return undefined;
+
+    const textCloser = findValidStrongCloser(linkText.value);
+    const urlCloser = findValidStrongCloser(link.url);
+    if (textCloser <= 0 || urlCloser <= 0) return undefined;
+
+    const linkStart = link.position?.start?.offset;
+    const linkEnd = link.position?.end?.offset;
+    if (
+      typeof linkStart !== 'number' ||
+      typeof linkEnd !== 'number' ||
+      !hasUnescapedValidCloser(source, linkStart, linkEnd)
+    ) {
+      return undefined;
+    }
+
+    const url = linkText.value.slice(0, textCloser);
+    if (!/^(?:https?:\/\/|www\.)/iu.test(url)) return undefined;
+
+    const suffix = linkText.value.slice(textCloser + 2);
+    const suffixNodes = suffix ? parseInlineSuffix(suffix) : [];
+
+    return {
+      href: link.url.slice(0, urlCloser),
+      url,
+      suffixNodes,
+    };
+  };
+
+  const wrapRepairedAutolink = (
+    link: MdastNode,
+    split: { href: string; url: string }
+  ): MdastNode => ({
+    type: 'strong' as const,
+    children: [createTextLinkNode(split.href, split.url, link.title ?? null)],
+  });
+
+  const tryRepairMalformedBoldAutolink = (
+    child: MdastNode,
+    nextChild: MdastNode | undefined,
+    source: string
+  ): MdastChildReplacement | undefined => {
+    if (child.type === 'strong' && child.children?.length === 1) {
+      const strongStart = child.position?.start?.offset;
+      if (!isUnescapedDoubleAsterisk(source, typeof strongStart === 'number' ? strongStart : -1)) {
+        return undefined;
+      }
+
+      const split = splitMalformedAutolink(child.children[0], source);
+      if (!split) return undefined;
+      return {
+        nodes: [wrapRepairedAutolink(child.children[0], split), ...split.suffixNodes],
+      };
+    }
+
+    if (child.type !== 'text' || typeof child.value !== 'string' || !child.value.endsWith('**')) {
+      return undefined;
+    }
+    if (!nextChild) return undefined;
+
+    const precedingEndOffset = child.position?.end?.offset;
+    if (
+      !isUnescapedDoubleAsterisk(
+        source,
+        typeof precedingEndOffset === 'number' ? precedingEndOffset - 2 : -1
+      )
+    ) {
+      return undefined;
+    }
+
+    const split = splitMalformedAutolink(nextChild, source);
+    if (!split) return undefined;
+
+    const repaired: MdastNode[] = [];
+    const textBeforeStrong = child.value.slice(0, -2);
+    if (textBeforeStrong) {
+      repaired.push({ ...child, value: textBeforeStrong });
+    }
+    repaired.push(wrapRepairedAutolink(nextChild, split), ...split.suffixNodes);
+    return { nodes: repaired, consumedSiblings: 1 };
+  };
+
+  // Runs before the bold repair. Every boundary character is Markdown
+  // punctuation or whitespace, so a `**` that becomes text-final here was
+  // already a valid strong closer in the source.
+  const trimNonAsciiAutolinkTail = (
+    child: MdastNode,
+    source: string
+  ): MdastChildReplacement | undefined => {
+    if (child.type !== 'link' || typeof child.url !== 'string') return undefined;
+    if (child.children?.length !== 1) return undefined;
+
+    const linkText = child.children[0];
+    if (linkText?.type !== 'text' || typeof linkText.value !== 'string') return undefined;
+    if (!isLiteralGfmAutolink(source, child, linkText)) return undefined;
+
+    const boundary = linkText.value.search(NON_ASCII_URL_BOUNDARY);
+    if (boundary <= 0) return undefined;
+
+    const tail = linkText.value.slice(boundary);
+    const url = truncateAutolinkUrl(child.url, tail);
+    if (url === undefined) return undefined;
+
+    return {
+      nodes: [
+        // Positions stay on the original source span so the bold repair can
+        // still tell this apart from an explicit `[text](url)` link.
+        { ...child, url, children: [{ ...linkText, value: linkText.value.slice(0, boundary) }] },
+        ...parseInlineSuffix(tail),
+      ],
+    };
+  };
+
+  return (tree: unknown, file: MarkdownFile) => {
+    const source = file.toString();
+    transformMdastChildren(tree, (child) => trimNonAsciiAutolinkTail(child, source));
+    transformMdastChildren(tree, (child, nextChild) =>
+      tryRepairMalformedBoldAutolink(child, nextChild, source)
+    );
+  };
+};
+
 const remarkLinkifyPlainUrls = () => {
-  const walk = (node: MdastNode) => {
-    if (node.type === 'link' || node.type === 'linkReference') return;
-    if (node.type === 'code') return;
-
-    const children = node.children;
-    if (!Array.isArray(children) || children.length === 0) return;
-
-    const nextChildren: MdastNode[] = [];
-    for (const child of children) {
+  return (tree: unknown) => {
+    transformMdastChildren(tree, (child) => {
       if (child.type === 'text' && typeof child.value === 'string') {
-        const linkified = linkifyTextValue(child.value);
-        nextChildren.push(...linkified);
-        continue;
+        return { nodes: linkifyTextValue(child.value) };
       }
 
       if (child.type === 'inlineCode' && typeof child.value === 'string') {
@@ -307,25 +601,12 @@ const remarkLinkifyPlainUrls = () => {
             }
             return { type: 'inlineCode', value: n.value };
           });
-          nextChildren.push(...wrappedChildren);
-        } else {
-          nextChildren.push(child);
+          return { nodes: wrappedChildren };
         }
-        continue;
       }
 
-      nextChildren.push(child);
-      walk(child);
-    }
-
-    node.children = nextChildren;
-  };
-
-  return (tree: unknown) => {
-    if (typeof tree !== 'object' || tree === null) return;
-    const root = tree as MdastNode;
-    if (typeof root.type !== 'string') return;
-    walk(root);
+      return undefined;
+    });
   };
 };
 
@@ -333,65 +614,37 @@ const remarkLinkifyPlainUrls = () => {
 // `link` nodes that explicit markdown file links use, so they flow through the
 // `a` -> AgentFileLink renderer. Runs AFTER URL linkify so URLs are already
 // `link` nodes (which this walk skips) and can't be re-grabbed as paths.
-const buildFilePathLinkNode = (path: string): MdastNode => ({
-  type: 'link',
-  url: path,
-  title: null,
-  children: [{ type: 'text', value: path }],
-});
-
 const remarkLinkifyFilePaths = () => {
-  const walk = (node: MdastNode) => {
-    if (node.type === 'link' || node.type === 'linkReference') return;
-    if (node.type === 'code') return;
-
-    const children = node.children;
-    if (!Array.isArray(children) || children.length === 0) return;
-
-    const nextChildren: MdastNode[] = [];
-    for (const child of children) {
+  return (tree: unknown) => {
+    transformMdastChildren(tree, (child) => {
       if (child.type === 'text' && typeof child.value === 'string') {
         const segments = splitTextIntoFilePathSegments(child.value);
-        if (segments.length === 1 && segments[0]?.type === 'text') {
-          nextChildren.push(child);
-          continue;
-        }
-        for (const segment of segments) {
-          nextChildren.push(
+        if (segments.length === 1 && segments[0]?.type === 'text') return undefined;
+
+        return {
+          nodes: segments.map((segment) =>
             segment.type === 'path'
-              ? buildFilePathLinkNode(segment.value)
+              ? createTextLinkNode(segment.value, segment.value)
               : { type: 'text', value: segment.value }
-          );
-        }
-        continue;
+          ),
+        };
       }
 
       if (child.type === 'inlineCode' && typeof child.value === 'string') {
         const path = matchWholeFilePath(child.value);
-        nextChildren.push(path ? buildFilePathLinkNode(path) : child);
-        continue;
+        return path ? { nodes: [createTextLinkNode(path, path)] } : undefined;
       }
 
-      nextChildren.push(child);
-      walk(child);
-    }
-
-    node.children = nextChildren;
-  };
-
-  return (tree: unknown) => {
-    if (typeof tree !== 'object' || tree === null) return;
-    const root = tree as MdastNode;
-    if (typeof root.type !== 'string') return;
-    walk(root);
+      return undefined;
+    });
   };
 };
 
 const MARKDOWN_REMARK_PLUGINS = [
   remarkGfm,
+  remarkRepairMalformedGfmAutolinks,
   remarkLinkifyPlainUrls,
   remarkLinkifyFilePaths,
-  remarkSingleDollarTextMath,
 ];
 
 const MARKDOWN_MATH_PLUGIN = createMathPlugin();
@@ -414,7 +667,6 @@ const MARKDOWN_CODE_LANGUAGES = [
   'bash',
   'shellscript',
   'markdown',
-  'diff',
   'python',
   'rust',
   'go',
@@ -612,6 +864,12 @@ const STREAMDOWN_PLUGINS = {
   code: MARKDOWN_CODE_PLUGIN,
   math: MARKDOWN_MATH_PLUGIN,
   mermaid: MARKDOWN_MERMAID_PLUGIN,
+  renderers: [
+    {
+      language: 'diff',
+      component: MarkdownDiffBlock,
+    },
+  ],
 } satisfies PluginConfig;
 
 const STREAMDOWN_CONTROLS = {
@@ -622,11 +880,18 @@ const STREAMDOWN_CONTROLS = {
   mermaid: {
     copy: true,
     download: true,
-    fullscreen: true,
+    // Streamdown's own full-screen overlay is off because its only exit is a
+    // 32px button at a raw `top-4 right-4`, which on a phone sits inside the
+    // status-bar inset while its content layer swallows every backdrop tap —
+    // an overlay a touch user cannot leave. `MermaidDiagramViewer` replaces it.
+    fullscreen: false,
     panZoom: false,
   },
   table: false,
 } satisfies ControlsConfig;
+
+/** Matches a fenced ```mermaid block, so blocks without one skip the observer. */
+const MERMAID_FENCE_PATTERN = /^[ \t]{0,3}(?:`{3,}|~{3,})[ \t]*mermaid\b/mu;
 
 const writeTextToClipboard = async (text: string): Promise<boolean> => {
   if (!text.trim()) return false;
@@ -704,31 +969,44 @@ const AgentFileLink = ({
       title={href}
       aria-label={`${hasOpenAction ? openAgentFileLabel : copyAgentFileLabel}: ${href}`}
       className={cn(
-        'inline-flex max-w-full items-center gap-1 rounded-md border border-border/60 bg-muted/40 px-1.5 py-px align-[-0.15em] font-mono text-[0.92em] leading-tight text-foreground no-underline shadow-none transition-colors',
-        'hover:border-border hover:bg-muted focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2'
+        'inline-flex max-w-full items-center gap-1 rounded-sm align-[-0.15em] text-sky-700 dark:text-sky-400 no-underline shadow-none transition-colors',
+        'hover:underline underline-offset-2 focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2'
       )}
     >
-      <FileIcon filePath={iconPath} className="h-3.5 w-3.5 shrink-0" />
+      <MonochromeFileIcon filePath={iconPath} className="h-3.5 w-3.5 shrink-0" />
       <span className="min-w-0 truncate">{children}</span>
       {!hasOpenAction ? (
         didCopy ? (
-          <Check className="h-3 w-3 shrink-0 text-emerald-600" />
+          <Check className="h-3 w-3 shrink-0" />
         ) : (
-          <Copy className="h-3 w-3 shrink-0 text-muted-foreground" />
+          <Copy className="h-3 w-3 shrink-0" />
         )
       ) : null}
     </button>
   );
 };
 
+function isWorkspaceResourceHref(href: string): boolean {
+  try {
+    return (
+      isMarkdownAgentFileHref(href) ||
+      /\/(?:api\/)?workspaces\/|\/session-(?:images|files)\//i.test(decodeURIComponent(href))
+    );
+  } catch {
+    return true;
+  }
+}
+
 const createMarkdownComponents = ({
   copyAgentFileLabel,
   openAgentFileLabel,
   onAgentFileLinkClick,
+  readonly,
 }: {
   copyAgentFileLabel: string;
   openAgentFileLabel: string;
   onAgentFileLinkClick?: (href: string) => void;
+  readonly: boolean;
 }): Components => ({
   inlineCode: (props: MarkdownCodeProps) => {
     const { className, children, style: _style, node: _node, inline: _inline, ...rest } = props;
@@ -757,6 +1035,11 @@ const createMarkdownComponents = ({
   },
   a: (props: MarkdownLinkProps) => {
     const { children, href, node: _node, rel, ...rest } = props;
+    // Workspace resource links are display-only in a publication, not a second
+    // download API. Ordinary article/GitHub links remain explicit external navigation.
+    if (readonly && href && isWorkspaceResourceHref(href)) {
+      return <span>{children}</span>;
+    }
 
     if (isMarkdownAgentFileHref(href)) {
       return (
@@ -785,6 +1068,33 @@ const createMarkdownComponents = ({
 });
 
 function TaskMarkdownImage(props: MarkdownImageProps) {
+  const readonly = useContext(SessionReadonlyContext);
+  // No workspace task hook or URI fetch is mounted for an anonymous publication.
+  // Typed share images are handled separately through the manifest attachment reader.
+  if (readonly) {
+    const inline =
+      typeof props.src === 'string' &&
+      /^data:image\/(?:png|jpeg|gif|webp);base64,[A-Za-z0-9+/=\s]+$/.test(props.src);
+    return inline ? (
+      <img
+        src={props.src}
+        alt={props.alt ?? ''}
+        className="my-2 max-h-[32rem] max-w-full rounded-md object-contain"
+      />
+    ) : (
+      <span
+        role="img"
+        aria-label={props.alt || 'Image'}
+        className="my-2 block text-sm text-muted-foreground"
+      >
+        {props.alt || 'Image'}
+      </span>
+    );
+  }
+  return <WorkspaceMarkdownImage {...props} />;
+}
+
+function WorkspaceMarkdownImage(props: MarkdownImageProps) {
   const { node: _node, src, alt, ...rest } = props;
   const taskImageId = src ? parseTaskImageMarkdownUrl(src) : null;
   const tasksEnabled = useAtomValue(tasksFeatureEnabledAtom);
@@ -848,20 +1158,39 @@ export const MarkdownRenderer = memo(function MarkdownRenderer({
 }) {
   const { t } = useTranslation();
   const resolvedTheme = useResolvedTheme();
+  const readonly = useContext(SessionReadonlyContext);
   const containerRef = useRef<HTMLDivElement>(null);
   const search = useSessionSearch();
   const searchMatch = useSessionSearchBlock(searchBlockId ?? '');
   const copyCodeLabel = t('common.copyCode', 'Copy code');
   const copyAgentFileLabel = t('sessions.copyAgentFilePath', 'Copy agent file path');
   const openAgentFileLabel = t('sessions.openAgentFile', 'Open agent file');
+  const canvasLabel = t('sessions.diagram.canvas', 'Zoom and pan diagram');
+  const openDiagramLabel = t('sessions.diagramViewer.open', 'Open diagram');
+  const hasMermaidBlock = useMemo(() => MERMAID_FENCE_PATTERN.test(text), [text]);
+  const normalizedText = useMemo(() => normalizeTexMathDelimiters(text), [text]);
+  const {
+    blocks: mermaidBlocks,
+    selection: diagramSelection,
+    closeDiagram,
+    openDiagram,
+    handleContainerClick,
+    handleContainerKeyDown,
+  } = useMermaidDiagramCanvas({
+    containerRef,
+    enabled: hasMermaidBlock,
+    canvasLabel,
+  });
+
   const components = useMemo(
     () =>
       createMarkdownComponents({
         copyAgentFileLabel,
         openAgentFileLabel,
         onAgentFileLinkClick,
+        readonly: readonly !== null,
       }),
-    [copyAgentFileLabel, onAgentFileLinkClick, openAgentFileLabel]
+    [copyAgentFileLabel, onAgentFileLinkClick, openAgentFileLabel, readonly]
   );
 
   const rehypePlugins = useMemo(() => (allowHtml ? [rehypeRaw, rehypeSanitize] : []), [allowHtml]);
@@ -1015,32 +1344,54 @@ export const MarkdownRenderer = memo(function MarkdownRenderer({
   }, [copyCodeLabel, search?.isOpen, search?.query, searchBlockId, searchMatch, text]);
 
   return (
-    <div
-      ref={containerRef}
-      data-search-block-id={searchBlockId}
-      className={cn(MARKDOWN_BASE_CLASSNAME, MARKDOWN_SIZE_CLASSNAME, className)}
-      style={markdownFontSizeStyle(normalizedSize)}
-    >
-      <Streamdown
-        // Streamdown's memo comparator does not include every rendering prop;
-        // remount when raw-HTML mode or Mermaid theme changes so sanitized
-        // rendering and diagram colors update correctly.
-        key={streamdownKey}
-        mode="streaming"
-        className="space-y-0"
-        controls={STREAMDOWN_CONTROLS}
-        isAnimating={isStreaming}
-        lineNumbers={false}
-        mermaid={mermaidOptions}
-        plugins={STREAMDOWN_PLUGINS}
-        remarkPlugins={MARKDOWN_REMARK_PLUGINS}
-        rehypePlugins={rehypePlugins}
-        components={components}
-        translations={streamdownTranslations}
-        urlTransform={markdownUrlTransform}
+    <>
+      <div
+        ref={containerRef}
+        data-search-block-id={searchBlockId}
+        className={cn(MARKDOWN_BASE_CLASSNAME, MARKDOWN_SIZE_CLASSNAME, className)}
+        style={markdownFontSizeStyle(normalizedSize)}
+        onClick={handleContainerClick}
+        onKeyDown={handleContainerKeyDown}
       >
-        {text}
-      </Streamdown>
-    </div>
+        <Streamdown
+          // Streamdown's memo comparator does not include every rendering prop;
+          // remount when raw-HTML mode or Mermaid theme changes so sanitized
+          // rendering and diagram colors update correctly.
+          key={streamdownKey}
+          mode="streaming"
+          className="space-y-0"
+          controls={STREAMDOWN_CONTROLS}
+          isAnimating={isStreaming}
+          lineNumbers={false}
+          mermaid={mermaidOptions}
+          plugins={STREAMDOWN_PLUGINS}
+          remarkPlugins={MARKDOWN_REMARK_PLUGINS}
+          rehypePlugins={rehypePlugins}
+          components={components}
+          translations={streamdownTranslations}
+          urlTransform={markdownUrlTransform}
+        >
+          {normalizedText}
+        </Streamdown>
+        {/* Streamdown's own action bar, filled by portal: its full-screen
+            control is off (its overlay is unusable on touch), and this one
+            opens `MermaidDiagramViewer` from the same always-visible row as
+            copy and download. */}
+        {mermaidBlocks.map((block) =>
+          createPortal(
+            <MermaidFullscreenButton
+              label={openDiagramLabel}
+              onOpen={() => openDiagram(block.diagram)}
+            />,
+            block.actions,
+            block.id
+          )
+        )}
+      </div>
+      {/* A sibling of the markdown, not a child: a portal's events bubble
+          through the React tree, and inside the container the viewer's own
+          clicks would reach the delegated open handler above. */}
+      <MermaidDiagramViewer selection={diagramSelection} onClose={closeDiagram} />
+    </>
   );
 });

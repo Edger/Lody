@@ -16,8 +16,10 @@ import {
 import type { AttachmentAddMenuMcp } from '@/components/chat/attachment-add-menu';
 import { ErrorBoundary } from '@/components/error-boundary';
 import type { MentionProjectSource } from '@/components/mentions/mention-project-file-source';
-import { ArrowUp, Bug, Download, ExternalLink, Loader2, Settings } from 'lucide-react';
+import { ArrowUp, Bug, Download, ExternalLink, Settings } from 'lucide-react';
+import { Spinner } from '@/ui/spinner';
 import type { PastedTextDraft } from '@/lib/pasted-text-draft';
+import { getDroppedFileLocalPath, toPathMentionInsertion } from '@/lib/dropped-local-path';
 import { MobileChatLandingScreen } from '@/components/mobile/mobile-chat-landing-screen';
 import { WebChatLandingScreen } from './web-chat-landing-screen';
 
@@ -245,6 +247,18 @@ export function ChatLandingView({
   const { mentionActionsRef, dropZone, overlayActive } = useSessionMentionDrop(
     !isMobile && !submissionPending
   );
+  // A folder is not an attachment — it becomes a `@path` mention, through the
+  // same handle the session drop uses, so it lands in this composer's draft.
+  const handleDirectoryDrop = useCallback(
+    (directories: File[]) => {
+      const insertions = directories.flatMap((directory) => {
+        const localPath = getDroppedFileLocalPath(directory);
+        return localPath ? [toPathMentionInsertion(localPath, 'dir')] : [];
+      });
+      mentionActionsRef.current?.insertPathMentions(insertions);
+    },
+    [mentionActionsRef]
+  );
 
   const {
     somethingWentWrong = 'Something went wrong',
@@ -295,12 +309,7 @@ export function ChatLandingView({
         )}
       >
         {isDaemonStartingHint ? (
-          <Loader2
-            className={cn(
-              'mt-0.5 h-4 w-4 shrink-0 animate-spin opacity-70',
-              'text-muted-foreground'
-            )}
-          />
+          <Spinner className="mt-0.5 h-4 w-4 opacity-70 text-muted-foreground" />
         ) : (
           <Download className={cn('mt-0.5 h-4 w-4 shrink-0 opacity-70', 'text-muted-foreground')} />
         )}
@@ -350,11 +359,7 @@ export function ChatLandingView({
         aria-label={submissionPending ? submittingLabel : submitLabel}
         className={cn(primaryActionButtonClassName, isMobile ? 'h-6 w-6' : 'h-7 w-7')}
       >
-        {submissionPending ? (
-          <Loader2 className="h-4 w-4 animate-spin" />
-        ) : (
-          <ArrowUp className="h-4 w-4" />
-        )}
+        {submissionPending ? <Spinner className="h-4 w-4" /> : <ArrowUp className="h-4 w-4" />}
       </Button>
     </ErrorBoundary>
   );
@@ -431,6 +436,7 @@ export function ChatLandingView({
         onPromptKeyDown={onPromptKeyDown}
         onPromptPaste={onPromptPaste}
         onImageDrop={submissionPending ? undefined : onImageDrop}
+        onDirectoryDrop={submissionPending ? undefined : handleDirectoryDrop}
         imageDropDisabled={submissionPending}
         promptPlaceholder={promptPlaceholder}
         promptDisabled={submissionPending}

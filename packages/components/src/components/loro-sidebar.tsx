@@ -1,3 +1,12 @@
+import { useTranslation } from 'react-i18next';
+import { isElectronRenderer, isMacOSElectronRenderer } from '@/lib/electron';
+import {
+  ContextMenu,
+  ContextMenuTrigger,
+  ContextMenuContent,
+  ContextMenuItem,
+} from '@/ui/context-menu';
+import { isNewWindowClick, openDesktopWindow } from '@/lib/desktop-window';
 import {
   type ComponentPropsWithoutRef,
   type PointerEvent as ReactPointerEvent,
@@ -19,6 +28,7 @@ import { Button } from '@/ui/button';
 import { Kbd } from '@/ui/kbd';
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/ui/tooltip';
 import { commands, formatKeyBinding, type ShortcutCommandId } from '@/lib/commands';
+import { setCommandPaletteOpen } from '@/lib/commands/palette-state';
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -31,6 +41,7 @@ import {
 } from '@/ui/dropdown-menu';
 import { ScrollArea } from '@/ui/scroll-area';
 import {
+  AppWindow,
   Archive,
   ListTodo,
   BookOpen,
@@ -39,13 +50,14 @@ import {
   Github,
   SquarePen,
   Link2,
-  Loader2,
   MessageSquareMore,
   PanelLeft,
   Plus,
+  Search,
   Settings,
   Users,
 } from 'lucide-react';
+import { Spinner } from '@/ui/spinner';
 import {
   SessionList,
   type SessionListProps,
@@ -71,6 +83,7 @@ export type LoroSidebarOrganizeMode = SidebarOrganizeMode;
 
 export type LoroSidebarWorkspace = {
   id: string;
+  slug?: string;
   name: string;
   logo?: string | null;
   /** Paid plan tier for the Plus/Enterprise badge; null/undefined = free. */
@@ -215,6 +228,8 @@ export interface LoroSidebarProps {
    * so both organize modes share the same destination handler.
    */
   onArchiveUpdatedItem?: (id: string) => void;
+  /** Mark a read session unread in the desktop Updated/Pinned lists. */
+  onMarkUpdatedItemUnread?: (id: string) => void;
   /** Rename an Updated row through the shared Rename Chat dialog. */
   onRenameUpdatedItem?: (id: string, nextTitle: string) => void | Promise<void>;
   /** Toggle pin for an Updated row. Mirrors `sessionListProps.onTogglePinSession`. */
@@ -453,7 +468,7 @@ function ConnectionPill({
       data-workspace-status={state}
     >
       {isLoading ? (
-        <Loader2 className="h-3 w-3 shrink-0 animate-spin" aria-hidden />
+        <Spinner className="h-3 w-3 shrink-0" aria-hidden />
       ) : (
         <span className="h-1.5 w-1.5 rounded-full bg-status-danger" aria-hidden />
       )}
@@ -652,6 +667,7 @@ export const LoroSidebar = memo(function LoroSidebar({
   onToggleUpdatedBucket,
   onToggleUpdatedShowFullBucket,
   onArchiveUpdatedItem,
+  onMarkUpdatedItemUnread,
   onRenameUpdatedItem,
   onToggleUpdatedItemPinned,
   onCopyUpdatedItemUrl,
@@ -679,6 +695,7 @@ export const LoroSidebar = memo(function LoroSidebar({
 }: LoroSidebarProps) {
   const isMobile = useIsMobile();
   const isElectronFullscreen = useElectronFullscreen();
+  const { t } = useTranslation();
   const mergedLabels: LoroSidebarLabels = {
     ...defaultLabels,
     ...labels,
@@ -919,26 +936,70 @@ export const LoroSidebar = memo(function LoroSidebar({
                       value={currentWorkspaceId}
                       onValueChange={(value) => onWorkspaceSelected?.(value)}
                     >
-                      {workspaces.map((ws) => (
-                        <DropdownMenuRadioItem key={ws.id} value={ws.id} className="gap-2">
-                          <WorkspaceAvatar
-                            workspace={{ name: ws.name, logo: ws.logo }}
-                            className="h-5 w-5 shrink-0 text-[10px]"
-                          />
-                          <span className="min-w-0 truncate">{ws.name}</span>
-                          {ws.planTier ? (
-                            <Badge
-                              variant="secondary"
-                              className="ml-auto shrink-0 px-1.5 py-0 text-[10px]"
-                            >
-                              {ws.planTier === 'enterprise'
-                                ? mergedLabels.planEnterprise
-                                : mergedLabels.planPlus}
-                            </Badge>
-                          ) : null}
-                        </DropdownMenuRadioItem>
-                      ))}
+                      {workspaces.map((ws) => {
+                        const workspaceSlug = ws.slug;
+                        const row = (
+                          <DropdownMenuRadioItem
+                            key={ws.id}
+                            value={ws.id}
+                            className="gap-2"
+                            onClickCapture={(event) => {
+                              if (!workspaceSlug || !isNewWindowClick(event)) return;
+                              if (openDesktopWindow(undefined, workspaceSlug)) {
+                                event.preventDefault();
+                                event.stopPropagation();
+                              }
+                            }}
+                          >
+                            <WorkspaceAvatar
+                              workspace={{ name: ws.name, logo: ws.logo }}
+                              className="h-5 w-5 shrink-0 text-[10px]"
+                            />
+                            <span className="min-w-0 truncate">{ws.name}</span>
+                            {ws.planTier ? (
+                              <Badge
+                                variant="secondary"
+                                className="ml-auto shrink-0 px-1.5 py-0 text-[10px]"
+                              >
+                                {ws.planTier === 'enterprise'
+                                  ? mergedLabels.planEnterprise
+                                  : mergedLabels.planPlus}
+                              </Badge>
+                            ) : null}
+                          </DropdownMenuRadioItem>
+                        );
+
+                        // Only wrap in a context menu where the window action
+                        // exists: a DISABLED ContextMenuTrigger stamps
+                        // `data-disabled` onto the row it wraps, and menu items
+                        // style that as `pointer-events-none`, which would make
+                        // every workspace unclickable in the browser.
+                        if (!isElectronRenderer() || !workspaceSlug) return row;
+
+                        return (
+                          <ContextMenu key={ws.id}>
+                            <ContextMenuTrigger asChild>{row}</ContextMenuTrigger>
+                            <ContextMenuContent>
+                              <ContextMenuItem
+                                onSelect={() => {
+                                  openDesktopWindow(undefined, workspaceSlug);
+                                }}
+                              >
+                                <AppWindow />
+                                {t('workspace.openInNewWindow')}
+                              </ContextMenuItem>
+                            </ContextMenuContent>
+                          </ContextMenu>
+                        );
+                      })}
                     </DropdownMenuRadioGroup>
+                    {isElectronRenderer() && workspaces.some((ws) => ws.slug) ? (
+                      <p className="px-2 py-1.5 text-xs text-muted-foreground">
+                        {t('workspace.openInNewWindowHint', {
+                          key: isMacOSElectronRenderer() ? '⌘' : 'Ctrl',
+                        })}
+                      </p>
+                    ) : null}
                     <DropdownMenuSeparator />
                   </>
                 ) : null}
@@ -997,7 +1058,7 @@ export const LoroSidebar = memo(function LoroSidebar({
 
         <div
           className={cn(
-            // `gap-px` keeps New chat / Tasks from painting as one fused block
+            // `gap-px` keeps navigation rows from painting as one fused block
             // when both are selected-adjacent or hover-highlighted.
             'flex flex-col gap-px',
             isMobile
@@ -1010,6 +1071,12 @@ export const LoroSidebar = memo(function LoroSidebar({
             label={mergedLabels.home}
             icon={<SquarePen className="h-4 w-4" />}
             onClick={onHomeClicked}
+          />
+          <NavButton
+            active={false}
+            label={t('common.search', 'Search')}
+            icon={<Search className="h-4 w-4" />}
+            onClick={() => setCommandPaletteOpen(true)}
           />
           {/* Tasks sits with New Chat rather than in the bottom icon rail: it is a
              primary destination, and the rail reads as utilities (docs, feedback,
@@ -1078,6 +1145,7 @@ export const LoroSidebar = memo(function LoroSidebar({
                   onToggleBucket={onTogglePinnedSection}
                   toggleBucketLabel={mergedLabels.pinned}
                   onArchiveItem={onArchiveUpdatedItem}
+                  onMarkItemUnread={onMarkUpdatedItemUnread}
                   onRenameItem={onRenameUpdatedItem}
                   onTogglePinItem={onToggleUpdatedItemPinned}
                   onCopyItemUrl={onCopyUpdatedItemUrl}
@@ -1115,6 +1183,7 @@ export const LoroSidebar = memo(function LoroSidebar({
                     onToggleBucket={onToggleUpdatedBucket}
                     onToggleFullBucket={onToggleUpdatedShowFullBucket}
                     onArchiveItem={onArchiveUpdatedItem}
+                    onMarkItemUnread={onMarkUpdatedItemUnread}
                     onRenameItem={onRenameUpdatedItem}
                     onTogglePinItem={onToggleUpdatedItemPinned}
                     onCopyItemUrl={onCopyUpdatedItemUrl}

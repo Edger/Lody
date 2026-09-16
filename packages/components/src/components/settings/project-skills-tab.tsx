@@ -1,8 +1,10 @@
 import { useMemo, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { formatDistanceToNow, type Locale } from 'date-fns';
-import { enUS, zhCN } from 'date-fns/locale';
-import { AlertCircle, Boxes, Info, Loader2, PackageOpen, RefreshCw, User } from 'lucide-react';
+import { enUS } from 'date-fns/locale/en-US';
+import { zhCN } from 'date-fns/locale/zh-CN';
+import { AlertCircle, Boxes, Info, PackageOpen, RefreshCw, Search, User } from 'lucide-react';
+import { Spinner } from '@/ui/spinner';
 import { DEFAULT_PROJECT_SKILL_DIR, type ProjectSkill, type ProjectSkillScope } from '@lody/shared';
 import { SkillDetailDialog } from './skill-detail';
 import { SkillScopeBadge, SkillSymlinkBadge, SkillVersionBadge } from './skill-badges';
@@ -13,7 +15,7 @@ import {
   type ProjectSkillsStatus,
 } from '@/hooks/use-project-skills';
 import { Button } from '@/ui/button';
-import { cn } from '@/lib/utils';
+import { Input } from '@/ui/input';
 
 /**
  * Desktop "Skills" sub-tab for a project detail pane (local + GitHub).
@@ -58,11 +60,26 @@ export function ProjectSkillsView({
   onRefresh,
 }: ProjectSkillsViewProps) {
   const { t, i18n } = useTranslation();
+  const [searchQuery, setSearchQuery] = useState('');
+  const normalizedSearchQuery = searchQuery.trim().toLowerCase();
   const locale: Locale = i18n.language?.startsWith('zh') ? zhCN : enUS;
   const totalSkills = useMemo(
     () => groups.reduce((sum, group) => sum + group.skills.length, 0),
     [groups]
   );
+  const filteredGroups = useMemo(() => {
+    if (!normalizedSearchQuery) return groups;
+
+    return groups.flatMap((group) => {
+      const skills = group.skills.filter((skill) =>
+        [skill.name, skill.description, skill.author, skill.relativePath].some((value) =>
+          value?.toLowerCase().includes(normalizedSearchQuery)
+        )
+      );
+      return skills.length > 0 ? [{ ...group, skills }] : [];
+    });
+  }, [groups, normalizedSearchQuery]);
+  const hasMatches = filteredGroups.some((group) => group.skills.length > 0);
 
   const isInitialLoading = status === 'loading' && groups.length === 0;
   const isRefreshing = status === 'refreshing';
@@ -70,7 +87,7 @@ export function ProjectSkillsView({
   if (isInitialLoading) {
     return (
       <div className="flex items-center justify-center gap-2 rounded-md border border-border/60 bg-muted/15 px-3 py-10 text-xs text-muted-foreground">
-        <Loader2 className="h-3.5 w-3.5 animate-spin" />
+        <Spinner className="h-3.5 w-3.5" />
         {t('workspace.projects.skills.loading', 'Loading skills')}
       </div>
     );
@@ -111,7 +128,7 @@ export function ProjectSkillsView({
         <div className="flex min-w-0 items-center gap-2 text-xs text-muted-foreground">
           {isRefreshing ? (
             <>
-              <Loader2 className="h-3.5 w-3.5 shrink-0 animate-spin" />
+              <Spinner className="h-3.5 w-3.5 shrink-0" />
               <span>{t('workspace.projects.skills.refreshing', 'Refreshing…')}</span>
             </>
           ) : status === 'error' && stale ? (
@@ -150,16 +167,42 @@ export function ProjectSkillsView({
           disabled={isRefreshing}
           onClick={onRefresh}
         >
-          <RefreshCw className={cn('h-3.5 w-3.5', isRefreshing && 'animate-spin')} />
+          <Spinner icon={RefreshCw} spinning={isRefreshing} className="h-3.5 w-3.5" />
           {t('workspace.projects.skills.refresh', 'Refresh')}
         </Button>
       </div>
 
-      <div className="flex flex-col gap-3">
-        {groups.map((group) => (
-          <SkillGroupCard key={`${group.scope}:${group.dir}`} group={group} />
-        ))}
+      <div className="relative">
+        <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
+        <Input
+          type="search"
+          value={searchQuery}
+          onChange={(event) => setSearchQuery(event.target.value)}
+          aria-label={t('workspace.projects.skills.searchLabel', 'Search skills')}
+          placeholder={t(
+            'workspace.projects.skills.searchPlaceholder',
+            'Search by name, description, author, or path'
+          )}
+          className="bg-input-field pl-9"
+        />
       </div>
+
+      {normalizedSearchQuery && !hasMatches ? (
+        <SkillsEmptyShell
+          icon={<Search className="h-4 w-4 text-muted-foreground" />}
+          title={t('workspace.projects.skills.noSearchResults', 'No matching skills')}
+          body={t(
+            'workspace.projects.skills.noSearchResultsHint',
+            'Try another name, description, author, or path.'
+          )}
+        />
+      ) : (
+        <div className="flex flex-col gap-3">
+          {filteredGroups.map((group) => (
+            <SkillGroupCard key={`${group.scope}:${group.dir}`} group={group} />
+          ))}
+        </div>
+      )}
     </div>
   );
 }

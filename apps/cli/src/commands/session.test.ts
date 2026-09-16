@@ -23,9 +23,9 @@ import {
 
 import {
   applyAgentRunConfigSelection,
+  archiveSessionWithSyncedMetadata,
   assertSupportedParentDepth,
   confirmDispatchSyncedBestEffort,
-  buildLegacyMachineRestoreQueueCleanupPatch,
   buildSessionArchiveMetaPatch,
   buildSessionRestoreMetaPatch,
   filterAuthorizedMachineMetas,
@@ -35,6 +35,7 @@ import {
   filterSessionMetas,
   hasNonPositionalPromptSource,
   listChildSessionIds,
+  listArchiveDescendantSessionIds,
   normalizeCliValue,
   rollbackPendingSessionCreate,
   renderSessionTranscript,
@@ -46,6 +47,7 @@ import {
   resolveOpenedBySessionRelation,
   resolveSessionCreateOwnerUserId,
   selectDefaultAgentConfigForCreate,
+  resolveSessionRequester,
   resolveSessionCommandRequesterUserId,
   resolveChatArgs,
   resolveRenameArgs,
@@ -56,7 +58,6 @@ import {
   resolveLocalProjectRefOrThrow,
   selectLocalProjectsBySelector,
   selectTargetMachineForCreate,
-  shouldQueueMachineDelete,
   shouldReadStdinForChatArgResolution,
   shouldWaitForSessionCompletion,
   selectSessionTranscriptEntries,
@@ -212,6 +213,41 @@ describe('session command helpers', () => {
     expect(withBuiltinDefaultTurnMode({}, createSessionMeta({ cliType: 'registry' }))).toEqual({});
   });
 
+  it('skips a builtin default mode the adapter does not offer', () => {
+    const grok = createSessionMeta({ agentType: 'grok' });
+    expect(withBuiltinDefaultTurnMode({}, grok)).toEqual({ modeId: 'default' });
+    expect(
+      withBuiltinDefaultTurnMode({}, grok, {
+        ...createAcpCapability(),
+        agentType: 'grok',
+        modes: [],
+        configOptions: [
+          {
+            id: 'permission_mode',
+            name: 'Permission Mode',
+            category: '_permission',
+            type: 'select',
+            currentValue: 'ask',
+            options: [
+              { value: 'ask', name: 'Ask' },
+              { value: 'always-approve', name: 'Always Approve' },
+            ],
+          },
+        ],
+      })
+    ).toEqual({});
+    expect(
+      withBuiltinDefaultTurnMode({}, grok, {
+        ...createAcpCapability(),
+        agentType: 'grok',
+        modes: [
+          { id: 'default', name: 'Agent' },
+          { id: 'plan', name: 'Plan' },
+        ],
+      })
+    ).toEqual({ modeId: 'default' });
+  });
+
   it('picks prompt candidates by explicit precedence', () => {
     expect(
       resolvePromptCandidate({
@@ -345,6 +381,19 @@ describe('session command helpers', () => {
     expect(resolveSessionCommandRequesterUserId({ userId: 'machine-owner' }, '   ')).toBe(
       'machine-owner'
     );
+  });
+
+  it('keeps delegated requester identity separate from the authenticated executor', () => {
+    const delegatedRequester = { userId: 'collaborator-b' };
+    expect(
+      resolveSessionRequester({ userId: 'machine-owner-a' }, undefined, delegatedRequester)
+    ).toEqual({ userId: 'collaborator-b', isDelegated: true });
+    expect(
+      resolveSessionRequester({ userId: 'machine-owner-c' }, undefined, delegatedRequester)
+    ).toEqual({ userId: 'collaborator-b', isDelegated: true });
+    expect(() =>
+      resolveSessionRequester({ userId: 'machine-owner-a' }, 'someone-else', delegatedRequester)
+    ).toThrow('Requester identity must match the delegated Session requester.');
   });
 
   it('keeps Session ownership separate from the authenticated requester', () => {
@@ -898,28 +947,7 @@ describe('session command helpers', () => {
     expect(warn).toHaveBeenCalledTimes(1);
   });
 
-  it('only queues machine-side deletion for sessions with repo-backed resources', () => {
-    expect(shouldQueueMachineDelete(createSessionMeta({ repoFullName: 'owner/repo' }))).toBe(true);
-    expect(
-      shouldQueueMachineDelete(
-        createSessionMeta({
-          parentSessionId: 'parent-session' as SessionId,
-          repoFullName: 'owner/repo',
-          isWorktree: true,
-        })
-      )
-    ).toBe(false);
-    expect(
-      shouldQueueMachineDelete(
-        createSessionMeta({
-          repoFullName: '   ',
-        })
-      )
-    ).toBe(false);
-    expect(shouldQueueMachineDelete(createSessionMeta())).toBe(false);
-  });
-
-  it('lists child sessions for lifecycle cascade commands', async () => {
+  it('selects opened descendants for archive but only contained tabs for deletion and restore', async () => {
     const parentSessionId = 'parent-session' as SessionId;
     const childSessionId = 'child-session' as SessionId;
     const otherSessionId = 'other-session' as SessionId;
@@ -936,7 +964,9 @@ describe('session command helpers', () => {
         };
       }
       if (roomId === getSessionRoomId(otherSessionId)) {
-        return { meta: createSessionMeta({ id: otherSessionId }) };
+        return {
+          meta: createSessionMeta({ id: otherSessionId, openedBySessionId: childSessionId }),
+        };
       }
       return undefined;
     });
@@ -954,7 +984,71 @@ describe('session command helpers', () => {
     } as any;
 
     await expect(listChildSessionIds(manager, parentSessionId)).resolves.toEqual([childSessionId]);
+    await expect(listArchiveDescendantSessionIds(manager, parentSessionId)).resolves.toEqual([
+      childSessionId,
+      otherSessionId,
+    ]);
   });
+
+  it.each([false, true])(
+    'synchronizes archive targets before mutation (sync fails: %s)',
+    async (failSync) => {
+      const root = createSessionMeta({ id: 'sync-root' as SessionId, isArchived: false });
+      const child = createSessionMeta({
+        id: 'sync-child' as SessionId,
+        openedBySessionId: root.id,
+        isArchived: false,
+      });
+      const docs = new Map([[getSessionRoomId(root.id), root]]);
+      let finishSync: () => void = () => {};
+      const syncGate = new Promise<void>((resolve) => {
+        finishSync = resolve;
+      });
+      let markSyncStarted: () => void = () => {};
+      const syncStarted = new Promise<void>((resolve) => {
+        markSyncStarted = resolve;
+      });
+      const manager = {
+        syncMetaOrThrow: async () => {
+          markSyncStarted();
+          await syncGate;
+          if (failSync) throw new Error('metadata unavailable');
+          docs.set(getSessionRoomId(child.id), child);
+        },
+        waitUntilMetaSynced: async () => true,
+        repo: {
+          getMeta: () => ({
+            scan: async () => [...docs.keys()].map((id) => ({ key: ['e', id], value: true })),
+          }),
+          getDocMeta: async (id: string) => ({ meta: docs.get(id) }),
+          upsertDocMeta: async (id: string, patch: Partial<SessionMeta>) => {
+            const meta = docs.get(id);
+            if (!meta) throw new Error('Unknown target');
+            docs.set(id, { ...meta, ...patch });
+          },
+        },
+      } as unknown as Parameters<typeof archiveSessionWithSyncedMetadata>[0];
+
+      const result = archiveSessionWithSyncedMetadata(manager, root.id);
+      await syncStarted;
+      expect(docs.get(getSessionRoomId(root.id))?.isArchived).toBe(false);
+      expect(docs.has(getSessionRoomId(child.id))).toBe(false);
+      finishSync();
+      if (failSync) {
+        await expect(result).rejects.toThrow('metadata unavailable');
+        expect(docs.get(getSessionRoomId(root.id))?.isArchived).toBe(false);
+        expect(docs.has(getSessionRoomId(child.id))).toBe(false);
+      } else {
+        await expect(result).resolves.toEqual([child.id]);
+        for (const session of [root, child]) {
+          expect(docs.get(getSessionRoomId(session.id))).toMatchObject({
+            isArchived: true,
+            status: { type: 'idle' },
+          });
+        }
+      }
+    }
+  );
 
   it('builds archive and restore patches without changing archive semantics', () => {
     expect(buildSessionArchiveMetaPatch()).toEqual({
@@ -964,27 +1058,6 @@ describe('session command helpers', () => {
     expect(buildSessionRestoreMetaPatch()).toEqual({
       isArchived: false,
     });
-
-    expect(
-      buildLegacyMachineRestoreQueueCleanupPatch('session-1', {
-        needToArchiveSessions: { 'session-1': true, 'session-2': true },
-        needToDeleteSessions: {
-          'session-1': { requestedAt: 2000 },
-          'session-3': { requestedAt: 2000 },
-        },
-      })
-    ).toEqual({
-      needToArchiveSessions: { 'session-2': true },
-      needToDeleteSessions: {
-        'session-3': { requestedAt: 2000 },
-      },
-    });
-    expect(
-      buildLegacyMachineRestoreQueueCleanupPatch('session-1', {
-        needToArchiveSessions: { 'session-2': true },
-        needToDeleteSessions: {},
-      })
-    ).toBeNull();
   });
 
   it('matches local project selectors against normalized paths', () => {

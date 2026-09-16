@@ -6,7 +6,7 @@ import { flushSync } from 'react-dom';
 import { createRoot, type Root } from 'react-dom/client';
 import { Provider } from 'jotai';
 import { SessionList } from '../src/components/session-list';
-import { SessionPrIcon, SessionRowLeadingSlot } from '../src/components/sidebar-row-shared';
+import { SessionPrIcon, SidebarRowEndSlot } from '../src/components/sidebar-row-shared';
 import { initI18n } from '../src/i18n';
 
 const PR_STATUS_CASES = [
@@ -350,22 +350,21 @@ describe('SessionList PR badge', () => {
     expect(emittedRenderUpdateWarning).toBe(false);
   });
 
-  it('keeps the working animation on an active-only fixed SVG', () => {
+  it('keeps the working animation on an active-only fixed wrapper', () => {
     container = document.createElement('div');
     document.body.appendChild(container);
     root = createRoot(container);
 
     flushSync(() => {
       root?.render(
-        React.createElement(SessionRowLeadingSlot, {
+        React.createElement(SidebarRowEndSlot, {
           isWorking: true,
-          menuLabel: 'More actions',
         })
       );
     });
 
     const spinner = container.querySelector('[data-session-working-spinner]');
-    expect(spinner?.tagName).toBe('svg');
+    expect(spinner?.tagName).toBe('SPAN');
     expect(spinner?.classList.contains('h-3')).toBe(true);
     expect(spinner?.classList.contains('w-3')).toBe(true);
     expect(spinner?.classList.contains('shrink-0')).toBe(true);
@@ -374,10 +373,9 @@ describe('SessionList PR badge', () => {
 
     flushSync(() => {
       root?.render(
-        React.createElement(SessionRowLeadingSlot, {
+        React.createElement(SidebarRowEndSlot, {
           isWorking: false,
           hasUnreadMessages: true,
-          menuLabel: 'More actions',
         })
       );
     });

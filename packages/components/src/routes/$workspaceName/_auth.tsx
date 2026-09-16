@@ -33,11 +33,11 @@ import { LoadingPlaceholder } from '@/components/loading-placeholder';
 import { useVisibleMachineMetas } from '@/hooks/use-visible-machine-metas';
 import { useFireOncePerKey } from '@/hooks/use-fire-once';
 import { writeLastAppRoutePath } from '@/lib/last-app-route';
-import { useWorkspaceBadge } from '@/hooks/use-workspace-badge';
 import { type LodyLiveActivityBridge, useLodyLiveActivity } from '@/hooks/use-lody-live-activity';
 import { isNativeIOSAppShell } from '@/lib/native-platform';
 import { isLocalAppPlatform } from '@/lib/app-platform';
 import { useResolvedWorkspaceScope } from '../../hooks/use-resolved-workspace-scope';
+import { useBillingOverviewPreload } from '../../hooks/use-billing-overview-preload';
 
 const AUTH_ROUTE_ONESIGNAL_LOGIN_IDLE_TIMEOUT_MS = 10_000;
 
@@ -77,19 +77,12 @@ function MainLayoutComponent() {
 
 function LocalPlatformLayoutContent({ workspaceName }: { workspaceName: string }) {
   // Same dock-badge / live-activity wiring as the cloud layout.
-  useWorkspaceBadge();
   useLodyLiveActivity({ workspaceName });
 
   return (
     <RouteSuspense>
       <LazyMainLayout>
-        <AuthedWorkspaceRouteTracker />
-        <Outlet />
-        <ElectronSessionCompletionNotifier />
-        <ElectronMenuHandler />
-        <AppCommands />
-        <CommandPalette />
-        <AutoArchivePrWatcher />
+        <AuthenticatedWorkspaceContent />
       </LazyMainLayout>
     </RouteSuspense>
   );
@@ -338,13 +331,13 @@ function AuthedLayoutContent({
   } = useOrganization({ targetSlug: workspaceName });
   const user = useAtomValue(userAtom);
   const { workspaceId: currentWorkspaceId } = useResolvedWorkspaceScope();
+  useBillingOverviewPreload(user ? currentWorkspaceId : null);
   const [orgSettled, setOrgSettled] = useState(!organizationsLoading);
   const [userSettled, setUserSettled] = useState(Boolean(user) && Boolean(currentWorkspaceId));
 
   // Push this workspace's owned-by-me unread/waiting counts to the Electron
   // dock badge. No-op on web. Mounted at the workspace layout so it lives
   // for the entire authenticated session (one subscriber per window).
-  useWorkspaceBadge();
   useLodyLiveActivity({ workspaceName });
 
   useEffect(() => {
@@ -381,14 +374,7 @@ function AuthedLayoutContent({
     return (
       <RouteSuspense>
         <LazyMainLayout>
-          <AuthedWorkspaceRouteTracker />
-          <Outlet />
-          <ElectronSessionCompletionNotifier />
-          <ElectronMenuHandler />
-          <AppCommands />
-          <CommandPalette />
-          <AutoArchivePrWatcher />
-          <WorkspaceCheckoutPendingDialog />
+          <AuthenticatedWorkspaceContent showWorkspaceCheckout />
         </LazyMainLayout>
       </RouteSuspense>
     );
@@ -446,15 +432,28 @@ function AuthedLayoutContent({
   return (
     <RouteSuspense>
       <LazyMainLayout>
-        <AuthedWorkspaceRouteTracker />
-        <Outlet />
-        <ElectronSessionCompletionNotifier />
-        <ElectronMenuHandler />
-        <CommandPalette />
-        <AutoArchivePrWatcher />
-        <WorkspaceCheckoutPendingDialog />
+        <AuthenticatedWorkspaceContent showWorkspaceCheckout />
       </LazyMainLayout>
     </RouteSuspense>
+  );
+}
+
+function AuthenticatedWorkspaceContent({
+  showWorkspaceCheckout = false,
+}: {
+  showWorkspaceCheckout?: boolean;
+}) {
+  return (
+    <>
+      <AuthedWorkspaceRouteTracker />
+      <Outlet />
+      <ElectronSessionCompletionNotifier />
+      <ElectronMenuHandler />
+      <AppCommands />
+      <CommandPalette />
+      <AutoArchivePrWatcher />
+      {showWorkspaceCheckout && <WorkspaceCheckoutPendingDialog />}
+    </>
   );
 }
 

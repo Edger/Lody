@@ -12,13 +12,13 @@ import {
   GitBranch,
   GitPullRequest,
   Link2,
-  Loader2,
   LockKeyhole,
   Pencil,
   Pin,
   PinOff,
   Users,
 } from 'lucide-react';
+import { Spinner } from '@/ui/spinner';
 import { useTranslation } from 'react-i18next';
 
 import { cn } from '@/lib/utils';
@@ -754,9 +754,6 @@ const UpdatedItemRow = memo(function UpdatedItemRow({
 
       <div className="flex w-full min-w-0 items-center gap-1.5 text-sm">
         <SessionRowLeadingSlot
-          isWaitingPermission={item.isWaitingPermission}
-          isWorking={item.isWorking}
-          hasUnreadMessages={item.hasUnreadMessages}
           showMenuButton={hasMenuActions}
           menuLabel={contextMenuLabels.moreActions}
           fadeClassName="group-hover/row:opacity-0"
@@ -787,6 +784,9 @@ const UpdatedItemRow = memo(function UpdatedItemRow({
         </div>
         {/* Keep PR at the right edge, with All Changes totals immediately before it. */}
         <SidebarRowEndSlot
+          isWaitingPermission={item.isWaitingPermission}
+          isWorking={item.isWorking}
+          hasUnreadMessages={item.hasUnreadMessages}
           fadeClassName="group-hover/row:opacity-0"
           restIcon={
             showPr ||
@@ -928,7 +928,7 @@ const UpdatedItemRow = memo(function UpdatedItemRow({
             {shareMenuState === 'share' ? (
               <Users />
             ) : shareMenuState === 'loading' ? (
-              <Loader2 className="animate-spin" />
+              <Spinner />
             ) : (
               <LockKeyhole />
             )}

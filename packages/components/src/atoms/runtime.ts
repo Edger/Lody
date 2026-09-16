@@ -1,6 +1,9 @@
+import type { LocalFilePreviewResource } from '@lody/shared/local-file-preview';
+import type { SessionData } from '@lody/shared/session-data';
 import { atom } from 'jotai';
 import type { LoroDoc } from 'loro-crdt';
 import type { LoroRepo } from 'loro-repo';
+import type { ConversationView } from '@/lib/conversation-view';
 import type {
   InferInputType,
   InferType,
@@ -16,6 +19,8 @@ import type {
   SessionPrepareCancelResponse,
   SessionPrepareResponse,
   SessionSteerResponse,
+  SessionGoalAction,
+  SessionGoalResponse,
   SessionDocMeta,
   SessionTurnInputConfig,
   SessionId,
@@ -72,16 +77,24 @@ import { readStoredAuthToken } from '@/lib/auth-bootstrap';
 import type { RoomSyncState } from '@/lib/room-sync-state';
 import { currentWorkspaceIdAtom, currentWorkspaceSlugAtom } from './workspace-context';
 
-export type SessionDocState = InferType<typeof sessionDocSchema>;
-export type SessionDocInput = InferInputType<typeof sessionDocSchema>;
+/**
+ * Control-plane state of a session doc. `history` is deliberately absent: the
+ * renderer reads turns through `SessionDocStore.history` (a `ConversationView`)
+ * and writes them through `SessionDocStore.sessionData.commands`, so opening a long
+ * conversation never materializes the whole list.
+ */
+export type SessionDocState = Omit<InferType<typeof sessionDocSchema>, 'history'>;
+export type SessionDocInput = Omit<InferInputType<typeof sessionDocSchema>, 'history'>;
+/** The draft `setState` updaters receive; history is not writable through it. */
+export type SessionDocDraft = Omit<SessionDocMeta, 'history'>;
 export type PreviewVisualCommentDocState = InferType<typeof previewVisualCommentDocSchema>;
 export type PreviewVisualCommentDocInput = InferInputType<typeof previewVisualCommentDocSchema>;
 
 export type SessionDocUpdater =
-  | Partial<SessionDocMeta>
+  | Partial<SessionDocDraft>
   | Partial<SessionDocInput>
-  | ((state: SessionDocMeta) => void)
-  | ((state: Readonly<SessionDocMeta>) => SessionDocMeta)
+  | ((state: SessionDocDraft) => void)
+  | ((state: Readonly<SessionDocDraft>) => SessionDocDraft)
   | ((state: Readonly<SessionDocInput>) => SessionDocInput);
 
 export type SessionDocStore = {
@@ -95,6 +108,10 @@ export type SessionDocStore = {
   getState: () => SessionDocState;
   setState: (updater: SessionDocUpdater) => void;
   subscribe: (listener: (state: SessionDocState) => void) => () => void;
+  /** Windowed read access to the session's turns; see `lib/conversation-view`. */
+  readonly history: ConversationView;
+  /** CRDT-neutral history reads, commands and stored-copy capabilities. */
+  readonly sessionData: SessionData;
   dispose: () => void;
   /**
    * Resolves when all pending local CRDT changes have been flushed to the server.
@@ -284,7 +301,7 @@ export type WorkspaceRuntime = {
     machineId: MachineId,
     sessionId: SessionId,
     turnId: string,
-    options?: { timeoutMs?: number }
+    options?: { timeoutMs?: number; subagentTaskId?: string }
   ) => Promise<SessionCancelResponse | null>;
   requestSessionSteer: (
     machineId: MachineId,
@@ -298,6 +315,16 @@ export type WorkspaceRuntime = {
     },
     options?: { timeoutMs?: number }
   ) => Promise<SessionSteerResponse | null>;
+  requestSessionGoal: (
+    machineId: MachineId,
+    args: {
+      sessionId: SessionId;
+      action: SessionGoalAction;
+      objective?: string;
+      userId: string;
+    },
+    options?: { timeoutMs?: number }
+  ) => Promise<SessionGoalResponse | null>;
   requestSessionTerminate: (
     machineId: MachineId,
     sessionId: SessionId,
@@ -367,7 +394,7 @@ export type WorkspaceRuntime = {
     machineId: MachineId,
     request: Omit<FilePreviewV3Request, 'v'>,
     options?: { timeoutMs?: number; ownerSessionId?: SessionId | string }
-  ) => Promise<FilePreviewV3Response>;
+  ) => Promise<FilePreviewV3Response | LocalFilePreviewResource>;
   /**
    * Electron-only initial Code Collab tree/current-All-Changes snapshot. This
    * never falls back to the cloud Machine RPC transport.

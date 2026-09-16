@@ -184,8 +184,10 @@ describe('MessageHandler machine registration', () => {
     expect(registeredMeta.protocolCapabilities).toEqual({
       acpAuthenticationInteractions: 2,
       localProjectRemoval: 1,
+      localFileResources: 1,
       providerSetup: 1,
       acpProtocolAuthentication: 2,
+      subagentCancellation: 1,
     });
 
     await handler.cleanup();

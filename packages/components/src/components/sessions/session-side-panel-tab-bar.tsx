@@ -1,15 +1,8 @@
 import { memo, useEffect, useRef, type ReactNode } from 'react';
-import {
-  FileDiff,
-  Files,
-  GitPullRequest,
-  Loader2,
-  MessageSquare,
-  MonitorPlay,
-  Plus,
-  X,
-} from 'lucide-react';
+import { FileDiff, Files, GitPullRequest, MessageSquare, MonitorPlay, Plus, X } from 'lucide-react';
+import { Spinner } from '@/ui/spinner';
 import { FileIcon } from '@/components/icons/file-icons';
+import { useHorizontalWheelScroll } from '@/hooks/use-horizontal-wheel-scroll';
 import { ScrollArea } from '@/ui/scroll-area';
 import {
   DropdownMenu,
@@ -128,12 +121,13 @@ type SessionSidePanelTabBarProps = {
   onPanelOpen?: (panelId: SessionSidePanelOption['id']) => void;
   addPanelLabel?: string;
   closeTabLabel: (tabLabel: string) => string;
+  /** Sits immediately left of the + button; empty for tabs with no actions. */
+  moreSlot?: ReactNode;
   endSlot?: ReactNode;
   className?: string;
 };
 
-const TAB_CLASS =
-  `group relative flex h-7 max-w-[180px] shrink-0 cursor-pointer items-center gap-1.5 rounded-md text-[13px] transition-colors ${WINDOW_DRAG_EXEMPT_CLASS}`;
+const TAB_CLASS = `group relative flex h-7 max-w-[180px] shrink-0 cursor-pointer items-center gap-1.5 rounded-md text-[13px] transition-colors ${WINDOW_DRAG_EXEMPT_CLASS}`;
 // Soft cool-gray pills on the white side panel (Linear-like), not heavy slate washes.
 const ACTIVE_TAB_CLASS =
   'bg-foreground/[0.08] text-tab-active-foreground shadow-[inset_0_0_0_1px_hsl(var(--border)/0.7)]';
@@ -142,7 +136,7 @@ const INACTIVE_TAB_CLASS =
 
 function SidePanelTabIcon({ tab }: { tab: SessionSidePanelTabItem }) {
   if (tab.pending) {
-    return <Loader2 className="h-3.5 w-3.5 animate-spin opacity-70" />;
+    return <Spinner className="h-3.5 w-3.5 opacity-70" />;
   }
   switch (tab.kind) {
     case 'files':
@@ -211,11 +205,13 @@ export const SessionSidePanelTabBar = memo(function SessionSidePanelTabBar({
   onPanelOpen = () => undefined,
   addPanelLabel = 'Add panel',
   closeTabLabel,
+  moreSlot,
   endSlot,
   className,
 }: SessionSidePanelTabBarProps) {
   const windowDragClass = useWindowDragRegionClass();
   const activeTabRef = useRef<HTMLDivElement>(null);
+  const viewportRef = useHorizontalWheelScroll();
 
   useEffect(() => {
     activeTabRef.current?.scrollIntoView({ block: 'nearest', inline: 'nearest' });
@@ -226,6 +222,7 @@ export const SessionSidePanelTabBar = memo(function SessionSidePanelTabBar({
       <ScrollArea
         scrollableX
         horizontalOnly
+        viewportRef={viewportRef}
         className="min-w-0 flex-1"
         // Compact overlay bar: default horizontal track is too tall in this h-11 strip.
         horizontalScrollbarClassName="h-1 border-0 p-0"
@@ -314,6 +311,9 @@ export const SessionSidePanelTabBar = memo(function SessionSidePanelTabBar({
           })}
         </div>
       </ScrollArea>
+      {moreSlot ? (
+        <div className={cn('flex shrink-0 items-center', WINDOW_DRAG_EXEMPT_CLASS)}>{moreSlot}</div>
+      ) : null}
       <DropdownMenu>
         <DropdownMenuTrigger asChild>
           <button

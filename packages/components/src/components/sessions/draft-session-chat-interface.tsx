@@ -62,6 +62,8 @@ import { filterAcpSessionConfigOptionValues } from '@/lib/acp-session-config-sel
 import { useComposerCycleCommands } from '@/hooks/use-composer-cycle-commands';
 import { ChildTabEmptyState } from './child-tab-empty-state';
 import { useSessionDoc } from '@/hooks/use-session-doc';
+import { useConversationTail, useConversationVersion } from '@/hooks/use-conversation-view';
+import { collectConversationConfigSources } from '@/lib/conversation-view';
 import {
   buildComposerAgentRoleItems,
   isComposerAgentRoleApplied,
@@ -184,12 +186,28 @@ export const DraftSessionChatInterface = memo(
       const { knownItems: knownIssuePrItems } = useKnownIssuePrItems(
         parentRepoFullName || undefined
       );
-      const { doc: parentSessionDoc, ready: parentSessionDocReady } = useSessionDoc(
-        parentSession.id
-      );
+      const {
+        doc: parentSessionDoc,
+        history: parentConversation,
+        ready: parentSessionDocReady,
+      } = useSessionDoc(parentSession.id);
+      // The latest user turn's config plus every older user turn's shallow
+      // role selection — what the resolver needs, without hydrating the parent.
+      const { from: parentTailFrom } = useConversationTail(parentConversation, {
+        extendToLastUserTurn: true,
+      });
+      const parentConversationVersion = useConversationVersion(parentConversation);
       const parentConversationConfig = useMemo(
-        () => resolveSessionConversationConfig(parentSessionDoc.history, parentSessionDoc.mq),
-        [parentSessionDoc.history, parentSessionDoc.mq]
+        () =>
+          resolveSessionConversationConfig(
+            parentConversation
+              ? collectConversationConfigSources(parentConversation, parentTailFrom)
+              : [],
+            parentSessionDoc.mq
+          ),
+        // `parentConversationVersion` is the change signal for the view's contents.
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+        [parentConversation, parentConversationVersion, parentTailFrom, parentSessionDoc.mq]
       );
       const preferAgentDefaults =
         draft.agentConfigId !== undefined && draft.agentConfigId !== parentSession.agentConfigId;
@@ -262,6 +280,7 @@ export const DraftSessionChatInterface = memo(
         machineFlockRows,
         modeOptions,
         modelOptions,
+        modelReasoningEfforts,
         sessionMachine,
       } = useSessionAcpSelectorContext({
         machineId: parentSession.machineId,
@@ -280,6 +299,7 @@ export const DraftSessionChatInterface = memo(
           defaultModelId,
           modeOptions,
           modelOptions,
+          modelReasoningEfforts,
         }),
         [
           capabilityAuthority,
@@ -288,16 +308,21 @@ export const DraftSessionChatInterface = memo(
           defaultModelId,
           modeOptions,
           modelOptions,
+          modelReasoningEfforts,
         ]
       );
-      const { selectedModeId, selectedModelId, configOptionValues } =
-        useResolvedAcpSessionConfigSelection(sessionConfigSelection, selectorOptions, {
-          cliType: draft.cliType,
-          agentType: draft.agentType,
-        });
+      const {
+        selectedModeId,
+        selectedModelId,
+        configOptionValues,
+        configOptionSelectors: resolvedConfigOptionSelectors,
+      } = useResolvedAcpSessionConfigSelection(sessionConfigSelection, selectorOptions, {
+        cliType: draft.cliType,
+        agentType: draft.agentType,
+      });
       const dispatchConfigOptionValues = useMemo(
-        () => filterAcpSessionConfigOptionValues(configOptionValues, configOptionSelectors),
-        [configOptionSelectors, configOptionValues]
+        () => filterAcpSessionConfigOptionValues(configOptionValues, resolvedConfigOptionSelectors),
+        [configOptionValues, resolvedConfigOptionSelectors]
       );
       const thinkEffortSelector = useMemo(
         () =>

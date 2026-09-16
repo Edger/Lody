@@ -46,13 +46,13 @@ import {
   ArrowUp,
   FolderOpen,
   Github as GithubIcon,
-  Loader2,
   LockKeyhole,
   Monitor,
   PanelLeft,
   RefreshCw,
   X,
 } from 'lucide-react';
+import { Spinner } from '@/ui/spinner';
 import { Button } from '@/ui/button';
 
 import {
@@ -71,7 +71,8 @@ import {
   mobileKeyboardActionAtom,
   runtimeInitializingAtom,
   setMobileDrawerOpenAtom,
-  sidebarCollapsedAtom,
+  navigationSidebarHiddenAtom,
+  showNavigationSidebarAtom,
   tasksFeatureEnabledAtom,
   userAtom,
   workspaceReposCacheAtomFamily,
@@ -80,6 +81,7 @@ import { docMetaCacheReadyAtom, sessionMetaCountAtom } from '@/atoms/doc-meta';
 import { localProbeAttemptedAtom, localProbeResultAtom } from '@/atoms/local-probe';
 import { lodyPresenceNowMsAtom, lodyPresenceStatesAtom } from '@/atoms/presence';
 import { buildAgentPrompt } from '@/lib';
+import { getAppCurrentPathWithSearch } from '@/lib/app-location';
 import { isImeComposingKeyboardEvent } from '@/lib/ime';
 import { useNavigate } from '@tanstack/react-router';
 import { activeWorkspaceRuntimeAtom, authTokenAtom, runtimeAtom } from '@/atoms/runtime';
@@ -176,18 +178,23 @@ import {
 import { toIntlLocale } from '@/lib/intl-locale';
 import {
   arePastedTextDraftsEqual,
+  getPastedTextByteSize,
   getPastedTextCharacterCount,
   getPastedTextDraftsAfterInsertion,
   insertPastedTextDraft,
+  isPastedTextTooLarge,
+  MAX_PASTED_TEXT_BYTE_SIZE,
   normalizePastedTextDraft,
   sanitizePastedTextDrafts,
   shouldCapturePastedTextDraft,
   type PastedTextDraft,
 } from '@/lib/pasted-text-draft';
+import { formatFileSize } from '@/lib/session-file-presentation';
 import { wrapPastedTextChipLabel } from '@/components/mentions/mention-chips';
 
 import { ErrorBoundary } from '@/components/error-boundary';
 import { ChatLandingView, type ChatLandingHintType } from './chat-landing-view';
+import { getSessionCreationNavigation } from './submission/use-composer-navigation-focus';
 import { BranchSelector, getSelectorTagClassName } from './chat-landing-selectors';
 import {
   extractIssuePRMentionsFromText,
@@ -199,6 +206,7 @@ import {
   arePersistedMentionRangesEqual,
   toPersistedMentionRanges,
 } from '@/components/mentions/mention-persistence';
+import { buildChatLandingDraftKey } from '@/atoms/chat-landing-draft';
 import { useChatLandingImageDraft } from '@/hooks/use-chat-landing-image-draft';
 import { useChatLandingFileDraft } from '@/hooks/use-chat-landing-file-draft';
 import { useChatLandingDraftSession } from '@/hooks/use-chat-landing-draft-session';
@@ -380,8 +388,6 @@ interface ChatLandingProps {
    * chat route only; mobile keeps its base-context model.
    */
   onSelectionUrlSync?: (search: ChatLandingSearch) => void;
-  resetDraftKey?: string;
-  resetDraftOnKeyChange?: boolean;
 }
 
 const getGitHubOwnerHandle = (fullName: string): string => {
@@ -557,8 +563,6 @@ function WorkspaceChatLanding({
   preSelectedProject,
   preSelectedRepo,
   onSelectionUrlSync,
-  resetDraftKey,
-  resetDraftOnKeyChange = true,
 }: ChatLandingProps) {
   const { t, i18n } = useTranslation();
   const navigate = useNavigate();
@@ -920,8 +924,8 @@ function WorkspaceChatLanding({
   } = useSessionActions();
   const openMobileDrawer = useSetAtom(setMobileDrawerOpenAtom);
   const setBugReportDialogOpen = useSetAtom(bugReportDialogOpenAtom);
-  const isLeftSidebarCollapsed = useAtomValue(sidebarCollapsedAtom);
-  const setLeftSidebarCollapsed = useSetAtom(sidebarCollapsedAtom);
+  const isLeftSidebarHidden = useAtomValue(navigationSidebarHiddenAtom);
+  const showNavigationSidebar = useSetAtom(showNavigationSidebarAtom);
   const visibleLocalMachineId = useMemo(() => {
     const machineId = localProbeResult?.machineId as MachineId | undefined;
     return machineId && machines.has(machineId) ? machineId : null;
@@ -949,9 +953,10 @@ function WorkspaceChatLanding({
   const analyticsProjectKind = contextType === 'chat' ? null : contextType;
 
   // ── Prompt state (shared across contexts) ──
-  const chatLandingStateKey = userId ?? null;
+  const chatLandingStateOwnerKey = userId ?? null;
+  const chatLandingDraftKey = buildChatLandingDraftKey(chatLandingStateOwnerKey, workspaceSlug);
   const [sessionState, setSessionState] = useAtom(
-    chatLandingSessionStateAtomFamily(chatLandingStateKey)
+    chatLandingSessionStateAtomFamily(chatLandingDraftKey)
   );
   const prompt = sessionState.prompt;
   const [draftActivityRevision, setDraftActivityRevision] = useState(0);
@@ -1277,7 +1282,7 @@ function WorkspaceChatLanding({
     sessionId: draftSessionId,
     ensureSessionId: ensureDraftSessionId,
     resetSessionId: resetDraftSessionId,
-  } = useChatLandingDraftSession();
+  } = useChatLandingDraftSession(chatLandingDraftKey);
   const attachmentInputRef = useRef<HTMLInputElement>(null);
   const {
     imageItems,
@@ -1291,6 +1296,7 @@ function WorkspaceChatLanding({
     clearPendingImages,
     buildInputBlocks,
   } = useChatLandingImageDraft({
+    draftKey: chatLandingDraftKey,
     workspaceId: (workspaceId as WorkspaceId | null) ?? null,
     authToken,
     isMobile,
@@ -1309,41 +1315,13 @@ function WorkspaceChatLanding({
     clearPendingFiles,
     buildFileInputBlocks,
   } = useChatLandingFileDraft({
+    draftKey: chatLandingDraftKey,
     workspaceId: (workspaceId as WorkspaceId | null) ?? null,
     authToken,
     machineId: selectedMachineId,
     sessionId: draftSessionId,
     ensureSessionId: ensureDraftSessionId,
   });
-  const lastAppliedResetDraftKeyRef = useRef<string | null>(null);
-
-  useEffect(() => {
-    if (!resetDraftKey) {
-      return;
-    }
-
-    const scopedResetKey = `${chatLandingStateKey ?? 'anonymous'}:${resetDraftKey}`;
-    if (lastAppliedResetDraftKeyRef.current === scopedResetKey) {
-      return;
-    }
-    lastAppliedResetDraftKeyRef.current = scopedResetKey;
-    if (resetDraftOnKeyChange) {
-      setSessionState({ prompt: '', pastedTextDrafts: [] });
-    }
-    setComposerStatus(null);
-    clearPendingImages();
-    clearPendingFiles();
-    resetDraftSessionId();
-  }, [
-    chatLandingStateKey,
-    clearPendingFiles,
-    clearPendingImages,
-    resetDraftSessionId,
-    resetDraftKey,
-    resetDraftOnKeyChange,
-    setSessionState,
-  ]);
-
   const insertLargePastedTextAtSelection = useCallback(
     (text: string) => {
       const normalizedText = normalizePastedTextDraft(text).trim();
@@ -1398,11 +1376,11 @@ function WorkspaceChatLanding({
   );
 
   // Auto-focus textarea on mount (desktop only)
-  const isMobileRef = useRef(isMobile);
-  isMobileRef.current = isMobile;
+  const mobileKeyboardRef = useRef(usesMobileKeyboardAction);
+  mobileKeyboardRef.current = usesMobileKeyboardAction;
   useEffect(() => {
     const id = requestAnimationFrame(() => {
-      if (!isMobileRef.current) {
+      if (!mobileKeyboardRef.current) {
         promptTextareaRef.current?.focus();
       }
     });
@@ -1667,14 +1645,18 @@ function WorkspaceChatLanding({
     machine: selectedMachine,
   });
   const { modeOptions, modelOptions, configOptionSelectors } = selectorOptions;
-  const { selectedModeId, selectedModelId, configOptionValues } =
-    useResolvedAcpSessionConfigSelection(sessionConfigSelection, selectorOptions, {
-      cliType: selectedConfig?.cliType,
-      agentType: selectedConfig?.agentType,
-    });
+  const {
+    selectedModeId,
+    selectedModelId,
+    configOptionValues,
+    configOptionSelectors: resolvedConfigOptionSelectors,
+  } = useResolvedAcpSessionConfigSelection(sessionConfigSelection, selectorOptions, {
+    cliType: selectedConfig?.cliType,
+    agentType: selectedConfig?.agentType,
+  });
   const dispatchConfigOptionValues = useMemo(
-    () => filterAcpSessionConfigOptionValues(configOptionValues, configOptionSelectors),
-    [configOptionSelectors, configOptionValues]
+    () => filterAcpSessionConfigOptionValues(configOptionValues, resolvedConfigOptionSelectors),
+    [configOptionValues, resolvedConfigOptionSelectors]
   );
   const selectedRateLimits =
     selectedConfig &&
@@ -1776,15 +1758,20 @@ function WorkspaceChatLanding({
       return;
     }
     setPendingRecentRunConfig(null);
-    if (
+    const appliedModelId =
       pendingRecentRunConfig.modelId &&
       modelOptions.some((option) => option.value === pendingRecentRunConfig.modelId)
-    ) {
-      setSelectedModelName(pendingRecentRunConfig.modelId);
+        ? pendingRecentRunConfig.modelId
+        : undefined;
+    if (appliedModelId) {
+      setSelectedModelName(appliedModelId);
     }
     for (const { configId, value } of resolveApplicableConfigOptionValues(
       pendingRecentRunConfig,
-      configOptionSelectors
+      configOptionSelectors,
+      // The selectors still describe the model this entry replaces, so its
+      // effort must not be validated against the outgoing model's ladder.
+      { switchesModel: appliedModelId !== undefined && appliedModelId !== selectedModelId }
     )) {
       handleConfigOptionChange(configId, value);
     }
@@ -1795,6 +1782,7 @@ function WorkspaceChatLanding({
     modelOptions,
     pendingRecentRunConfig,
     selectedAgent,
+    selectedModelId,
     sessionConfigSelection.edits.model,
     setSelectedModelName,
   ]);
@@ -2775,6 +2763,25 @@ function WorkspaceChatLanding({
     (event: ClipboardEvent<HTMLTextAreaElement>) => {
       const text = event.clipboardData.getData('text/plain');
 
+      // Refuse the whole paste rather than silently truncating it: a blob this
+      // large is a log dump, and a half-pasted log is worse than none.
+      if (text && isPastedTextTooLarge(text)) {
+        event.preventDefault();
+        toast.error(
+          t('composer.pastedTextTooLarge', 'Pasted text is too large ({{size}}).', {
+            size: formatFileSize(getPastedTextByteSize(text)),
+          }),
+          {
+            description: t(
+              'composer.pastedTextTooLargeDescription',
+              'The limit is {{limit}}. Attach it as a file instead.',
+              { limit: formatFileSize(MAX_PASTED_TEXT_BYTE_SIZE) }
+            ),
+          }
+        );
+        return;
+      }
+
       if (text && shouldCapturePastedTextDraft(text)) {
         event.preventDefault();
         if (insertLargePastedTextAtSelection(text)) {
@@ -2801,7 +2808,7 @@ function WorkspaceChatLanding({
 
       handleImagePromptPaste(event);
     },
-    [addFileAttachments, addFiles, handleImagePromptPaste, insertLargePastedTextAtSelection]
+    [addFileAttachments, addFiles, handleImagePromptPaste, insertLargePastedTextAtSelection, t]
   );
   const handleImageDrop = useCallback(
     (files: File[]) => {
@@ -3253,10 +3260,9 @@ function WorkspaceChatLanding({
         promptTextareaRef.current?.blur();
         setMobileNewChatOpen(false);
       }
-      await navigate({
-        to: '/$workspaceName/sessions/$sessionId',
-        params: { workspaceName: workspaceSlug, sessionId },
-      });
+      await navigate(
+        getSessionCreationNavigation(workspaceSlug, sessionId, usesMobileKeyboardAction)
+      );
     } catch (error) {
       capturePostHogEvent(postHog, 'session/start_failed', {
         user_id: userId ?? null,
@@ -3705,11 +3711,19 @@ function WorkspaceChatLanding({
       name="ChatLandingTopSelector"
       variant="inline"
       resetKeys={[workspaceId, selectedRepo, selectedLocalProject, selectedMachineId, contextType]}
-      fallback={
-        <div className={cn(selectorTagClassName, 'text-xs leading-tight')}>
-          {t('common.unavailable', 'Unavailable')}
-        </div>
-      }
+      fallbackRender={({ resetErrorBoundary }) => (
+        <Button
+          type="button"
+          variant="ghost"
+          size="sm"
+          className={cn(selectorTagClassName, 'text-xs leading-tight')}
+          onClick={resetErrorBoundary}
+          aria-label={t('chat.retryTargetSelector', 'Retry target selector')}
+        >
+          <RefreshCw aria-hidden="true" className="size-3" />
+          {t('common.retry', 'Retry')}
+        </Button>
+      )}
     >
       <div className="flex w-full min-w-0 items-center gap-2">
         <DesktopMachineMenu
@@ -6105,11 +6119,7 @@ function WorkspaceChatLanding({
                   'bg-foreground text-background hover:bg-foreground/90 hover:text-background active:translate-y-[1px]'
                 )}
               >
-                {submitting ? (
-                  <Loader2 className="h-5 w-5 animate-spin" />
-                ) : (
-                  <ArrowUp className="h-5 w-5" />
-                )}
+                {submitting ? <Spinner className="h-5 w-5" /> : <ArrowUp className="h-5 w-5" />}
               </Button>
             }
             autoResize
@@ -6415,6 +6425,7 @@ function WorkspaceChatLanding({
             void navigate({
               to: '/$workspaceName/settings',
               params: { workspaceName: workspaceSlug },
+              search: { from: getAppCurrentPathWithSearch() },
             });
           }}
           /* New-chat chip opens the bottom-sheet composer. Stays on the
@@ -6557,12 +6568,12 @@ function WorkspaceChatLanding({
         onGoToAgentSettings={handleGoToAgentSettings}
         onOpenMobileDrawer={() => openMobileDrawer(true)}
         leftSidebarExpandSlot={
-          !isMobile && isLeftSidebarCollapsed ? (
+          !isMobile && isLeftSidebarHidden ? (
             <Button
               type="button"
               variant="ghost"
               size="icon"
-              onClick={() => setLeftSidebarCollapsed(false)}
+              onClick={() => showNavigationSidebar()}
               aria-label={t('chat.leftSidebar.show', 'Show navigation sidebar')}
               className="h-7 w-7 shrink-0 text-muted-foreground"
             >

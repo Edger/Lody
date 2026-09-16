@@ -1,3 +1,6 @@
+import { isElectronRenderer } from '@/lib/electron';
+import { openSessionOnModifiedClick } from '@/lib/desktop-window';
+import { SessionWindowMenuItem } from './session-window-menu-item';
 import { cn } from '@/lib/utils';
 import {
   closestCenter,
@@ -23,14 +26,15 @@ import {
   GitPullRequest,
   GripVertical,
   Link2,
-  Loader2,
   LockKeyhole,
+  Mail,
   Pencil,
   Pin,
   PinOff,
   Plus,
   Users,
 } from 'lucide-react';
+import { Spinner } from '@/ui/spinner';
 import {
   memo,
   useCallback,
@@ -187,6 +191,7 @@ export type SessionListProps = {
   onToggleRepoCollapsed?: (repoFullName: string) => void;
   onToggleChatsCollapsed?: () => void;
   onArchiveSession?: (sessionId: string) => void;
+  onMarkSessionUnread?: (sessionId: string) => void;
   onRenameSession?: (sessionId: string, nextTitle: string) => void | Promise<void>;
   /** Toggle pin state for a session. Receives the next desired state (true = pin, false = unpin). */
   onTogglePinSession?: (sessionId: string, nextPinned: boolean) => void;
@@ -486,6 +491,7 @@ type SessionGroupSectionProps = {
   onToggleRepoCollapsed?: (repoFullName: string) => void;
   onToggleChatsCollapsed?: () => void;
   onArchiveSession?: (sessionId: string) => void;
+  onMarkSessionUnread?: (sessionId: string) => void;
   onRenameSession?: (sessionId: string, nextTitle: string) => void | Promise<void>;
   onTogglePinSession?: (sessionId: string, nextPinned: boolean) => void;
   onCopySessionUrl?: (sessionId: string) => void;
@@ -519,6 +525,7 @@ export type ContextMenuLabels = {
   pin: string;
   unpin: string;
   archive: string;
+  markUnread: string;
   copyUrl: string;
   shareWithTeam: string;
   onlyOwnerCanShare: string;
@@ -538,6 +545,7 @@ const SessionGroupSection = memo(function SessionGroupSection({
   onToggleRepoCollapsed,
   onToggleChatsCollapsed,
   onArchiveSession,
+  onMarkSessionUnread,
   onRenameSession,
   onTogglePinSession,
   onCopySessionUrl,
@@ -794,6 +802,8 @@ const SessionGroupSection = memo(function SessionGroupSection({
               prStatus !== 'closed';
             const showMergeablePill = isMergeable && !isSelected;
             const canArchive = typeof onArchiveSession === 'function';
+            const canMarkUnread =
+              typeof onMarkSessionUnread === 'function' && !session.hasUnreadMessages;
             const showInlineArchive = canArchive && !isMobile;
             const isChatSession = group.kind === 'chat';
             // Copy URL stays available for private sessions (the link still
@@ -834,6 +844,7 @@ const SessionGroupSection = memo(function SessionGroupSection({
             );
             const handleAnchorClick = useAnchor
               ? (event: ReactMouseEvent<HTMLAnchorElement>) => {
+                  if (openSessionOnModifiedClick(event, session.sessionId)) return;
                   if (
                     event.metaKey ||
                     event.ctrlKey ||
@@ -864,6 +875,7 @@ const SessionGroupSection = memo(function SessionGroupSection({
               onRenameSession ||
               onTogglePinSession ||
               onArchiveSession ||
+              canMarkUnread ||
               onCopySessionUrl ||
               shareMenuState ||
               session.branchName ||
@@ -914,8 +926,9 @@ const SessionGroupSection = memo(function SessionGroupSection({
                 onClick={
                   useAnchor
                     ? undefined
-                    : () => {
+                    : (event) => {
                         if (!isSelectable) return;
+                        if (openSessionOnModifiedClick(event, session.sessionId)) return;
                         onSelectSession?.(session.sessionId);
                       }
                 }
@@ -923,6 +936,10 @@ const SessionGroupSection = memo(function SessionGroupSection({
                   useAnchor
                     ? undefined
                     : (e) => {
+                        // Nested controls (such as the opened-session disclosure) own their
+                        // keyboard activation. Selecting the row here would navigate before
+                        // the control receives its native click.
+                        if (e.currentTarget !== e.target) return;
                         if (!isSelectable) return;
                         if (e.key === 'Enter' || e.key === ' ') {
                           e.preventDefault();
@@ -944,9 +961,6 @@ const SessionGroupSection = memo(function SessionGroupSection({
                 ) : null}
                 <div className="flex min-w-0 items-center gap-1.5">
                   <SessionRowLeadingSlot
-                    isWaitingPermission={session.isWaitingPermission}
-                    isWorking={session.isWorking}
-                    hasUnreadMessages={session.hasUnreadMessages}
                     showMenuButton={hasMenuActions}
                     menuLabel={moreActionsLabel}
                     openedByTree={openedByTreeSlot}
@@ -978,6 +992,9 @@ const SessionGroupSection = memo(function SessionGroupSection({
                   </div>
                   {/* Keep PR at the right edge, with All Changes totals immediately before it. */}
                   <SidebarRowEndSlot
+                    isWaitingPermission={session.isWaitingPermission}
+                    isWorking={session.isWorking}
+                    hasUnreadMessages={session.hasUnreadMessages}
                     restIcon={
                       isChatSession ? (
                         <span className={cn('flex items-center gap-1.5', useAnchor && 'z-20')}>
@@ -1034,7 +1051,113 @@ const SessionGroupSection = memo(function SessionGroupSection({
                 <ContextMenuContent className="min-w-[180px]">
                   <SessionRowOpenedByMenuItems
                     opener={openedByOpener}
-                    separateToggle={hasStandardMenuActions}
+                    goToOpenerLabel={contextMenuLabels.goToOpenerSession}
+                  />
+                  {onTogglePinSession ? (
+                    <ContextMenuItem
+                      onSelect={() => {
+                        onTogglePinSession(session.sessionId, !session.isPinned);
+                      }}
+                    >
+                      {session.isPinned ? <PinOff /> : <Pin />}
+                      {session.isPinned ? contextMenuLabels.unpin : contextMenuLabels.pin}
+                    </ContextMenuItem>
+                  ) : null}
+                  {canMarkUnread ? (
+                    <ContextMenuItem
+                      onSelect={() => {
+                        onMarkSessionUnread?.(session.sessionId);
+                      }}
+                    >
+                      <Mail />
+                      {contextMenuLabels.markUnread}
+                    </ContextMenuItem>
+                  ) : null}
+                  {onRenameSession ? (
+                    <ContextMenuItem
+                      onSelect={() => {
+                        beginRename(session.sessionId, session.title);
+                      }}
+                    >
+                      <Pencil />
+                      {contextMenuLabels.rename}
+                    </ContextMenuItem>
+                  ) : null}
+                  {(openedByOpener || onTogglePinSession || canMarkUnread || onRenameSession) &&
+                  (onCopySessionUrl || session.branchName || shareMenuState) ? (
+                    <ContextMenuSeparator />
+                  ) : null}
+                  {onCopySessionUrl ? (
+                    <ContextMenuItem
+                      onSelect={() => {
+                        onCopySessionUrl(session.sessionId);
+                      }}
+                    >
+                      <Link2 />
+                      {contextMenuLabels.copyUrl}
+                    </ContextMenuItem>
+                  ) : null}
+                  {session.branchName ? (
+                    <ContextMenuItem
+                      onSelect={() => {
+                        void navigator.clipboard.writeText(session.branchName).catch(() => {});
+                      }}
+                    >
+                      <GitBranch />
+                      {contextMenuLabels.copyBranch}
+                    </ContextMenuItem>
+                  ) : null}
+                  {shareMenuState ? (
+                    <ContextMenuItem
+                      disabled={shareMenuState !== 'share'}
+                      onSelect={() => {
+                        onShareSessionWithTeam?.(session.sessionId);
+                      }}
+                    >
+                      {shareMenuState === 'share' ? (
+                        <Users />
+                      ) : shareMenuState === 'loading' ? (
+                        <Spinner />
+                      ) : (
+                        <LockKeyhole />
+                      )}
+                      {shareMenuState === 'share'
+                        ? contextMenuLabels.shareWithTeam
+                        : shareMenuState === 'unregistered'
+                          ? contextMenuLabels.registerDeviceToShare
+                          : shareMenuState === 'owner-only'
+                            ? contextMenuLabels.onlyOwnerCanShare
+                            : contextMenuLabels.loadingSharing}
+                    </ContextMenuItem>
+                  ) : null}
+                  {(openedByOpener ||
+                    onTogglePinSession ||
+                    canMarkUnread ||
+                    onRenameSession ||
+                    onCopySessionUrl ||
+                    session.branchName ||
+                    shareMenuState) &&
+                  ((onOpenPullRequest && prUrl) ||
+                    (canGoToOpener && openerSessionId) ||
+                    isElectronRenderer()) ? (
+                    <ContextMenuSeparator />
+                  ) : null}
+                  {onOpenPullRequest && prUrl ? (
+                    <ContextMenuItem
+                      onSelect={() => {
+                        onOpenPullRequest({
+                          sessionId: session.sessionId,
+                          repoFullName: group.repoFullName,
+                          prUrl,
+                          prNumber,
+                        });
+                      }}
+                    >
+                      <GitPullRequest />
+                      {contextMenuLabels.openPr}
+                    </ContextMenuItem>
+                  ) : null}
+                  <SessionRowOpenedByMenuItems
                     goToOpener={
                       canGoToOpener && openerSessionId
                         ? () => {
@@ -1048,49 +1171,19 @@ const SessionGroupSection = memo(function SessionGroupSection({
                     }
                     goToOpenerLabel={contextMenuLabels.goToOpenerSession}
                   />
-                  {onOpenPullRequest && prUrl ? (
-                    <>
-                      <ContextMenuItem
-                        onSelect={() => {
-                          onOpenPullRequest({
-                            sessionId: session.sessionId,
-                            repoFullName: group.repoFullName,
-                            prUrl,
-                            prNumber,
-                          });
-                        }}
-                      >
-                        <GitPullRequest />
-                        {contextMenuLabels.openPr}
-                      </ContextMenuItem>
-                      {onRenameSession ||
-                      onTogglePinSession ||
-                      onArchiveSession ||
-                      onCopySessionUrl ||
-                      session.branchName ? (
-                        <ContextMenuSeparator />
-                      ) : null}
-                    </>
-                  ) : null}
-                  {onRenameSession ? (
-                    <ContextMenuItem
-                      onSelect={() => {
-                        beginRename(session.sessionId, session.title);
-                      }}
-                    >
-                      <Pencil />
-                      {contextMenuLabels.rename}
-                    </ContextMenuItem>
-                  ) : null}
-                  {onTogglePinSession ? (
-                    <ContextMenuItem
-                      onSelect={() => {
-                        onTogglePinSession(session.sessionId, !session.isPinned);
-                      }}
-                    >
-                      {session.isPinned ? <PinOff /> : <Pin />}
-                      {session.isPinned ? contextMenuLabels.unpin : contextMenuLabels.pin}
-                    </ContextMenuItem>
+                  <SessionWindowMenuItem sessionId={session.sessionId} />
+                  {(openedByOpener ||
+                    onTogglePinSession ||
+                    canMarkUnread ||
+                    onRenameSession ||
+                    onCopySessionUrl ||
+                    session.branchName ||
+                    shareMenuState ||
+                    (onOpenPullRequest && prUrl) ||
+                    (canGoToOpener && openerSessionId) ||
+                    isElectronRenderer()) &&
+                  onArchiveSession ? (
+                    <ContextMenuSeparator />
                   ) : null}
                   {onArchiveSession ? (
                     <ContextMenuItem
@@ -1100,53 +1193,6 @@ const SessionGroupSection = memo(function SessionGroupSection({
                     >
                       <Archive />
                       {contextMenuLabels.archive}
-                    </ContextMenuItem>
-                  ) : null}
-                  {(onRenameSession || onTogglePinSession || onArchiveSession) &&
-                  (onCopySessionUrl || session.branchName) ? (
-                    <ContextMenuSeparator />
-                  ) : null}
-                  {onCopySessionUrl ? (
-                    <ContextMenuItem
-                      onSelect={() => {
-                        onCopySessionUrl(session.sessionId);
-                      }}
-                    >
-                      <Link2 />
-                      {contextMenuLabels.copyUrl}
-                    </ContextMenuItem>
-                  ) : null}
-                  {shareMenuState ? (
-                    <ContextMenuItem
-                      disabled={shareMenuState !== 'share'}
-                      onSelect={() => {
-                        onShareSessionWithTeam?.(session.sessionId);
-                      }}
-                    >
-                      {shareMenuState === 'share' ? (
-                        <Users />
-                      ) : shareMenuState === 'loading' ? (
-                        <Loader2 className="animate-spin" />
-                      ) : (
-                        <LockKeyhole />
-                      )}
-                      {shareMenuState === 'share'
-                        ? contextMenuLabels.shareWithTeam
-                        : shareMenuState === 'unregistered'
-                          ? contextMenuLabels.registerDeviceToShare
-                          : shareMenuState === 'owner-only'
-                            ? contextMenuLabels.onlyOwnerCanShare
-                            : contextMenuLabels.loadingSharing}
-                    </ContextMenuItem>
-                  ) : null}
-                  {session.branchName ? (
-                    <ContextMenuItem
-                      onSelect={() => {
-                        void navigator.clipboard.writeText(session.branchName).catch(() => {});
-                      }}
-                    >
-                      <GitBranch />
-                      {contextMenuLabels.copyBranch}
                     </ContextMenuItem>
                   ) : null}
                 </ContextMenuContent>
@@ -1344,6 +1390,7 @@ export const SessionList = memo(function SessionList({
   onToggleRepoCollapsed,
   onToggleChatsCollapsed,
   onArchiveSession,
+  onMarkSessionUnread,
   onRenameSession,
   onTogglePinSession,
   onCopySessionUrl,
@@ -1366,6 +1413,7 @@ export const SessionList = memo(function SessionList({
       pin: t('sessions.contextMenu.pin', 'Pin Session'),
       unpin: t('sessions.contextMenu.unpin', 'Unpin Session'),
       archive: t('sessions.contextMenu.archive', 'Archive Session'),
+      markUnread: t('sessions.contextMenu.markUnread', 'Mark as unread'),
       copyUrl: t('sessions.contextMenu.copyUrl', 'Copy Session URL'),
       shareWithTeam: t('sessions.sharing.shareWithTeam', 'Share with team…'),
       onlyOwnerCanShare: t('sessions.sharing.onlyOwnerCanShare', 'Only the device owner can share'),
@@ -1493,6 +1541,7 @@ export const SessionList = memo(function SessionList({
                     onToggleRepoCollapsed={onToggleRepoCollapsed}
                     onToggleChatsCollapsed={onToggleChatsCollapsed}
                     onArchiveSession={onArchiveSession}
+                    onMarkSessionUnread={onMarkSessionUnread}
                     onRenameSession={onRenameSession}
                     onTogglePinSession={onTogglePinSession}
                     onCopySessionUrl={onCopySessionUrl}
@@ -1526,6 +1575,7 @@ export const SessionList = memo(function SessionList({
                   onToggleRepoCollapsed={onToggleRepoCollapsed}
                   onToggleChatsCollapsed={onToggleChatsCollapsed}
                   onArchiveSession={onArchiveSession}
+                  onMarkSessionUnread={onMarkSessionUnread}
                   onRenameSession={onRenameSession}
                   onTogglePinSession={onTogglePinSession}
                   onCopySessionUrl={onCopySessionUrl}

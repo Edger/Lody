@@ -1,3 +1,7 @@
+import { jotaiStore } from '@/lib/utils';
+import { desktopWindowId } from '@/lib/desktop-window';
+import { navigationSidebarHiddenAtom } from '@/atoms/layout-state';
+import { getMachineRoomId, type MachineMeta } from '@lody/shared';
 import { LoroRepo, type RepoRoomSubscription, type RepoWatchHandle } from 'loro-repo';
 import { IndexedDBStorageAdaptor } from 'loro-repo/storage/indexeddb';
 import { StreamsTransportAdapter } from 'loro-repo/transport/streams';
@@ -35,7 +39,6 @@ import {
   SESSION_DOC_PREFIX,
   type SessionStatus,
   LORO_STREAMS_BUCKET_ID,
-  sessionDocSchema,
   ClientToServerSchema,
   ServerToClientSchema,
   type ClientToServer,
@@ -64,10 +67,12 @@ import {
   type LodyPresenceStateMap,
   type LoroStreamsTokenProviderEvent,
   type SyncReason,
+  ACP_CAPABILITIES_REFRESH_CLIENT_BACKSTOP_MS,
 } from '@lody/shared';
 import { LocalLoroTransportAdapter } from '@lody/shared/local-loro-transport';
 import type { TaskId, WorkspaceId } from '@lody/shared';
 import { createDirectWorkspaceWriter } from './workspace-writer-impl';
+import { createConversationSession } from '@/lib/conversation-view';
 import {
   WorkspaceTargetRouter,
   type WorkspaceTransportRoom,
@@ -79,6 +84,7 @@ import { LoroDoc, EphemeralStore } from 'loro-crdt';
 import {
   WorkspaceRuntime,
   type PreviewVisualCommentDocStore,
+  type SessionDocState,
   type SessionDocStore,
   type TaskDocStore,
 } from '@/atoms/runtime';
@@ -113,6 +119,8 @@ import {
   createEagerSyncHighWaterStore,
   type EagerSyncHighWaterCache,
 } from '@/lib/eager-sync-high-water-cache';
+import { createEagerSyncWorkerClient } from './eager-sync-worker-client';
+import { readEagerSyncSnapshot } from './eager-sync-snapshot-cache';
 import { isRemoteCursorDebugEnabled } from '@/lib/remote-cursor-debug';
 import { META_REMOTE_CURSOR_BYPASS_STORAGE_KEY_PREFIX } from '@/lib/clear-local-cache';
 import { runStartupAcpCapabilitiesRefresh } from './startup-acp-capabilities-refresh';
@@ -139,6 +147,22 @@ export type WorkspaceRuntimeAnalyticsEvent = {
   name: string;
   properties: Record<string, unknown>;
 };
+
+export function resolveWorkspaceRuntimeCacheIdentity(
+  workspaceId: WorkspaceId,
+  windowId: string
+): {
+  namespace: string;
+  repoDbName: string;
+  remoteCursorDbName: string;
+} {
+  const namespace = windowId ? `${workspaceId}:${windowId}` : workspaceId;
+  return {
+    namespace,
+    repoDbName: `lody-loro-repo-db-${namespace}`,
+    remoteCursorDbName: `lody-loro-stream-cursors-${namespace}`,
+  };
+}
 
 type RuntimeDeps = {
   /**
@@ -367,6 +391,7 @@ function createPendingResponseRegistry<T>(defaultTimeoutMs: number) {
 }
 
 export async function createWorkspaceRuntime(deps: RuntimeDeps): Promise<WorkspaceRuntime> {
+  const cacheIdentity = resolveWorkspaceRuntimeCacheIdentity(deps.workspaceId, desktopWindowId());
   const createDeferred = <T>() => {
     let resolve: ((value: T | PromiseLike<T>) => void) | undefined;
     let reject: ((reason?: unknown) => void) | undefined;
@@ -391,7 +416,7 @@ export async function createWorkspaceRuntime(deps: RuntimeDeps): Promise<Workspa
     | null = null;
   const repo = await LoroRepo.create({
     storageAdapter: new IndexedDBStorageAdaptor({
-      dbName: 'lody-loro-repo-db-' + deps.workspaceId,
+      dbName: cacheIdentity.repoDbName,
     }),
     metaDebounceCommitMs: 0,
     resolveRoomTransports: (room) =>
@@ -416,7 +441,7 @@ export async function createWorkspaceRuntime(deps: RuntimeDeps): Promise<Workspa
     );
   };
   const remoteCursorStore = createResilientRemoteCursorStore({
-    dbName: 'lody-loro-stream-cursors-' + deps.workspaceId,
+    dbName: cacheIdentity.remoteCursorDbName,
     shouldBypassPrimaryLoad: shouldBypassMetaRemoteCursorLoad,
     onWarning: (message, context) => {
       console.warn(message, {
@@ -461,10 +486,18 @@ export async function createWorkspaceRuntime(deps: RuntimeDeps): Promise<Workspa
   let metaSub: RepoRoomSubscription | null = null;
   let cloudMetaTracker: RoomSyncTracker | null = null;
   let streamsTokenProvider: LoroStreamsTokenProvider | null = null;
+  // One long-lived auth callback per provider. `createAuthCallback()` remembers
+  // the last token it handed out, which is the only fallback left when a
+  // transport reports `unauthorized` without a `previousToken`. A callback
+  // created per invocation always starts with an empty memory and would make
+  // the provider return the rejected token unchanged.
+  let eagerSyncAuthCallback: ReturnType<LoroStreamsTokenProvider['createAuthCallback']> | null =
+    null;
   let jsonStreamClient: LoroStreamsJsonStreamClient | null = null;
   let machineRpcStreamsClientReady: Promise<LoroStreamsJsonStreamClient> | null = null;
   let transportStreamsBaseUrl: string | null = null;
   let detachMetaRoomStatusListener: (() => void) | null = null;
+  let metaRoomJoinPromise: Promise<void> | null = null;
   // Meta room health tracker, registered in roomSyncRegistry like every other
   // room (durable sessions, presence). Recreated fresh on each
   // ensureMetaRoomSynced cycle so stale first-sync/status state from a
@@ -576,6 +609,7 @@ export async function createWorkspaceRuntime(deps: RuntimeDeps): Promise<Workspa
   let backgroundSyncCoordinator: BackgroundSyncCoordinator | null = null;
   let backgroundSyncCoordinatorStartPromise: Promise<void> | null = null;
   let backgroundSyncHighWaterStore: EagerSyncHighWaterCache | null = null;
+  let eagerSyncWorkerClient: ReturnType<typeof createEagerSyncWorkerClient> | null = null;
   let cancelDelayedBackgroundSyncStart: (() => void) | null = null;
   let startBackgroundSyncCoordinator: () => void = () => {};
 
@@ -1511,6 +1545,7 @@ export async function createWorkspaceRuntime(deps: RuntimeDeps): Promise<Workspa
         authToken: () => authToken,
         onEvent: logTokenProviderEvent,
       });
+      eagerSyncAuthCallback = streamsTokenProvider.createAuthCallback();
     }
     return streamsTokenProvider;
   };
@@ -1654,6 +1689,7 @@ export async function createWorkspaceRuntime(deps: RuntimeDeps): Promise<Workspa
   const {
     requestSessionCancel,
     requestSessionSteer,
+    requestSessionGoal,
     requestSessionTerminate,
     requestSessionFork,
     requestSessionEditAndResend,
@@ -1679,6 +1715,10 @@ export async function createWorkspaceRuntime(deps: RuntimeDeps): Promise<Workspa
     requestLocalProjectControl,
     requestMachineBugReport,
   } = createWorkspaceMachineRpcFacade({
+    getMachineProtocolCapabilities: async (machineId) => {
+      const entry = await repo.getDocMeta(getMachineRoomId(machineId));
+      return (entry?.meta as Partial<MachineMeta> | undefined)?.protocolCapabilities;
+    },
     workspaceId,
     targetRouter,
     getMachineRpcClient,
@@ -1828,7 +1868,10 @@ export async function createWorkspaceRuntime(deps: RuntimeDeps): Promise<Workspa
           }
         },
         signal: options.signal,
-        timeoutMs: 120000,
+        // Backstop only: the machine owns this deadline and reports its own
+        // reason, so this must stay above the machine's worst case rather than
+        // expiring a refresh the machine is still working on.
+        timeoutMs: ACP_CAPABILITIES_REFRESH_CLIENT_BACKSTOP_MS,
       });
       return (
         response ?? {
@@ -2482,6 +2525,9 @@ export async function createWorkspaceRuntime(deps: RuntimeDeps): Promise<Workspa
           if (signal.aborted) return;
           await resyncMachineFlockRows({ repo, workspaceId }, machineId, {
             requireRemoteSync: true,
+            refreshedCapability: response.capability
+              ? { configId: response.configId, value: response.capability }
+              : undefined,
           });
         },
         onError: (error, context) => {
@@ -2597,6 +2643,7 @@ export async function createWorkspaceRuntime(deps: RuntimeDeps): Promise<Workspa
     if (invalidateTokenProvider) {
       streamsTokenProvider?.invalidate();
       streamsTokenProvider = null;
+      eagerSyncAuthCallback = null;
     }
     detachMetaRoomStatusListener?.();
     detachMetaRoomStatusListener = null;
@@ -2623,6 +2670,7 @@ export async function createWorkspaceRuntime(deps: RuntimeDeps): Promise<Workspa
       metaSub = null;
     }
 
+    eagerSyncWorkerClient?.cancelAll();
     // Remove both planes' transports (loro-repo keeps room leases; their
     // bindings report 'detached' until a later attach).
     if (transportAttached) {
@@ -2945,9 +2993,10 @@ export async function createWorkspaceRuntime(deps: RuntimeDeps): Promise<Workspa
     transportStreamsBaseUrl = null;
     streamsTokenProvider?.invalidate();
     streamsTokenProvider = null;
+    eagerSyncAuthCallback = null;
   };
 
-  const ensureMetaRoomSynced = async (syncPhase: 'initial' | 'recovery' = 'initial') => {
+  const joinAndWatchMetaRoom = async (syncPhase: 'initial' | 'recovery') => {
     if (metaSub) {
       return;
     }
@@ -3153,8 +3202,28 @@ export async function createWorkspaceRuntime(deps: RuntimeDeps): Promise<Workspa
     void watchMetaFirstSync(
       'Failed to sync repo meta room',
       'Timed out waiting for repo meta room initial sync',
-      'initial'
+      syncPhase
     );
+  };
+
+  const ensureMetaRoomSynced = async (syncPhase: 'initial' | 'recovery' = 'initial') => {
+    if (metaSub) {
+      return;
+    }
+    if (metaRoomJoinPromise) {
+      await metaRoomJoinPromise;
+      return;
+    }
+
+    const pendingJoin = joinAndWatchMetaRoom(syncPhase);
+    metaRoomJoinPromise = pendingJoin;
+    try {
+      await pendingJoin;
+    } finally {
+      if (metaRoomJoinPromise === pendingJoin) {
+        metaRoomJoinPromise = null;
+      }
+    }
   };
 
   const restartDurableTransportForMetaSyncRecovery = async (reason: string): Promise<void> => {
@@ -3256,13 +3325,11 @@ export async function createWorkspaceRuntime(deps: RuntimeDeps): Promise<Workspa
           initialMetaSyncFailed,
         }
       );
-      if (!metaSub) {
-        await ensureMetaRoomSynced();
-      }
       notifyConnectionStateInputsChanged();
       // A fresh token is a hard reconnect signal: connections that died on 401
       // while the old token was stale (e.g. wake after a long sleep) can only
-      // recover now. trigger() resets the retry backoff and reconciles.
+      // recover now. The forced run is immediate but remains part of the same
+      // recovery episode, so repeated rotations cannot erase its backoff.
       localReconnectLoop?.trigger('token-refresh');
       return;
     }
@@ -3402,6 +3469,12 @@ export async function createWorkspaceRuntime(deps: RuntimeDeps): Promise<Workspa
               ? { transportIds: ['local'], resetBackoff: true }
               : { resetBackoff: true }
           );
+          // A failed repo-level meta attach leaves no subscription for
+          // repo.reconnect() to revive. Rejoin it through the same recovery
+          // episode instead of letting auth refresh start a new initial sync.
+          if (!metaSub && !disposePromise) {
+            await ensureMetaRoomSynced('recovery');
+          }
         }
       }
       if (
@@ -3615,21 +3688,74 @@ export async function createWorkspaceRuntime(deps: RuntimeDeps): Promise<Workspa
    * Create a session store that can read local data immediately (offline-first).
    * Remote sync is deferred until transport is ready (workspaceId is set).
    */
+  const eagerSyncScope = workspaceId;
+  const materializedSessionIds = new Set<SessionId>();
+  eagerSyncWorkerClient = createEagerSyncWorkerClient({
+    workspaceId,
+    scope: eagerSyncScope,
+    localConnection: createLocalLoroDataPlaneConnection,
+    resolveTransport: async (roomId) => {
+      await targetRouter.prepareDocTarget(roomId);
+      const plane = targetRouter.getReadinessTransportForRoom({ kind: 'doc', id: roomId });
+      if (plane === 'local') return { plane: 'local' };
+      if (!cloudPlaneEnabled || !streamsTokenProvider) {
+        throw new Error('Eager-sync cloud transport unavailable');
+      }
+      // Prime endpoint-derived routing before handing the transport to the worker.
+      await streamsTokenProvider.getToken();
+      // Match the mounted foreground transport. `transportStreamsBaseUrl`
+      // records the endpoint selected when that transport was attached.
+      const baseUrl = transportStreamsBaseUrl ?? getStreamsBaseUrlForProvider(streamsTokenProvider);
+      return {
+        plane: 'cloud',
+        streamId: getLoroStreamIdForDocId(workspaceId, roomId),
+        options: {
+          bucketId: LORO_STREAMS_BUCKET_ID,
+          metaStreamId: getLoroMetaStreamId(workspaceId),
+          baseUrl,
+          shardUrls: getLoroStreamsShardUrls(
+            baseUrl,
+            getStreamsShardHostSuffixForProvider(streamsTokenProvider)
+          ),
+        },
+      };
+    },
+    auth: async (context) => {
+      if (!cloudPlaneEnabled || !eagerSyncAuthCallback) return undefined;
+      return eagerSyncAuthCallback(context);
+    },
+  });
+
   const createSessionStore = async (sessionId: SessionId): Promise<SessionDocStore> => {
     const roomId = getSessionRoomId(sessionId);
 
     // Open persisted doc immediately - this reads from local IndexedDB
     // and does NOT require transport/workspaceId
     const persistedDoc = await repo.openPersistedDoc(roomId);
+    const sessionDoc = persistedDoc.doc as LoroDoc;
 
-    const mirror = new Mirror({
-      doc: persistedDoc.doc as LoroDoc,
-      schema: sessionDocSchema,
-      // Tolerate root keys written by peers running a newer schema version.
-      ignoreUnknownProperties: true,
-      // Plan is now stored per-turn on history entries, not at root level
-      initialState: { session: { id: sessionId }, history: [] },
-      debug: false,
+    // Only an actual store consumer materializes a prefetched snapshot. Import
+    // merges with this replica's unsent user edits; never replace its document.
+    const cached = await withTimeout(
+      readEagerSyncSnapshot(eagerSyncScope, roomId),
+      1_500,
+      'Eager-sync cache read timed out'
+    ).catch(() => undefined);
+    if (cached) {
+      try {
+        (persistedDoc.doc as LoroDoc).import(new Uint8Array(await cached.snapshot.arrayBuffer()));
+      } catch {
+        // A rebuildable cache must not prevent normal foreground synchronization.
+      }
+    }
+
+    const {
+      mirror,
+      history,
+      sessionData,
+      dispose: disposeConversation,
+    } = createConversationSession(sessionDoc, {
+      sessionId,
     });
 
     const syncTracker = createTrackedRoomSyncTracker(roomId);
@@ -3662,8 +3788,8 @@ export async function createWorkspaceRuntime(deps: RuntimeDeps): Promise<Workspa
         sub.unsubscribe();
         // unsubscribe() does not emit a status change, so the tracker would keep
         // reporting its last 'synced' state. Reset it to idle so the room-sync
-        // registry no longer treats this warmed room as joined (which would
-        // suppress eager sync and block warm-doc LRU eviction).
+        // registry no longer treats this cached UI room as joined, which would
+        // suppress future eager sync.
         syncTracker.markStopped();
       }
     };
@@ -3760,16 +3886,19 @@ export async function createWorkspaceRuntime(deps: RuntimeDeps): Promise<Workspa
         syncTracker.subscribeSyncState((state) => {
           listener(syncLeaseCount > 0 || roomSub || syncJoinPromise ? state : 'idle');
         }),
-      getState: () => mirror.getState(),
+      getState: () => mirror.getState() as SessionDocState,
       setState: (updater) => {
         mirror.setState(updater as never);
       },
-      subscribe: (listener) => mirror.subscribe(listener),
+      subscribe: (listener) => mirror.subscribe(listener as never),
+      history,
+      sessionData,
       dispose: () => {
         disposed = true;
+        materializedSessionIds.delete(sessionId);
         stopSyncNow();
         syncTracker.dispose();
-        mirror.dispose();
+        disposeConversation();
       },
       waitUntilSynced: async (signal?: AbortSignal) => {
         await transportReady.promise;
@@ -3806,7 +3935,16 @@ export async function createWorkspaceRuntime(deps: RuntimeDeps): Promise<Workspa
   };
 
   const sessionStoreCache = createManagedStoreCache<SessionId, SessionDocStore>({
-    create: createSessionStore,
+    create: async (sessionId) => {
+      materializedSessionIds.add(sessionId);
+      eagerSyncWorkerClient?.cancel(getSessionRoomId(sessionId));
+      try {
+        return await createSessionStore(sessionId);
+      } catch (error) {
+        materializedSessionIds.delete(sessionId);
+        throw error;
+      }
+    },
     releaseDelayMs: STORE_RELEASE_DELAY_MS,
     // The cache is the doc's sole application-layer owner: hard release = stop
     // sync + Mirror.dispose (store.dispose) + repo.unloadDoc, serialized per key
@@ -4031,7 +4169,7 @@ export async function createWorkspaceRuntime(deps: RuntimeDeps): Promise<Workspa
 
   // --- Background eager-sync coordinator ports -----------------------------
   // These adapters wire the pure BackgroundSyncCoordinator to runtime internals:
-  // session metadata (activity), the session store cache (one-shot prefetch),
+  // session metadata (activity), the isolated worker (one-shot prefetch),
   // and browser online/visibility (env). The coordinator itself imports none of
   // these — see background-sync-coordinator.ts.
   const sessionIdFromRoomId = (roomId: string): SessionId =>
@@ -4171,7 +4309,7 @@ export async function createWorkspaceRuntime(deps: RuntimeDeps): Promise<Workspa
     watchHandles.push(watchHandle);
 
     backgroundSyncCoordinatorStartPromise = (async () => {
-      const highWaterStore = await createEagerSyncHighWaterStore(workspaceId);
+      const highWaterStore = await createEagerSyncHighWaterStore(cacheIdentity.namespace);
       if (disposePromise) {
         highWaterStore.close();
         return;
@@ -4192,58 +4330,26 @@ export async function createWorkspaceRuntime(deps: RuntimeDeps): Promise<Workspa
         },
         registry: roomSyncRegistry,
         prefetcher: {
-          prefetch: async (sessionId, signal) => {
-            if (signal.aborted) {
+          prefetch: async (sessionId, lastMessageAt, signal) => {
+            if (signal.aborted || materializedSessionIds.has(sessionId)) {
               return 'skipped';
             }
-            let store: SessionDocStore;
-            try {
-              store = await sessionStoreCache.acquire(sessionId);
-            } catch {
-              return 'failed';
-            }
-            // Hold our own sync lease across the wait so the store reports the live
-            // tracker state (not 'idle') when we inspect the outcome below.
-            const releaseSync = store.acquireSync();
-            try {
-              const synced = store
-                // Pass the abort signal so offline/hidden/timeout cancellation
-                // actually releases the inner sync lease and lets the room join/SSE
-                // tear down, instead of leaving it alive until it settles on its own.
-                .waitUntilSynced(signal)
-                // waitUntilSynced() resolves even when the room join failed (no
-                // subscription → it awaits `undefined`). Only treat it as a real
-                // catch-up if the room actually reached 'synced'; otherwise it is a
-                // failure and must NOT advance the coordinator's synced high-water
-                // mark (which would suppress retries).
-                .then((): 'synced' | 'failed' =>
-                  store.getSyncState() === 'synced' ? 'synced' : 'failed'
-                )
-                .catch((): 'failed' => 'failed');
-              const aborted = new Promise<'skipped'>((resolve) => {
-                if (signal.aborted) {
-                  resolve('skipped');
-                  return;
-                }
-                signal.addEventListener('abort', () => resolve('skipped'), { once: true });
-              });
-              return await Promise.race([synced, aborted]);
-            } finally {
-              releaseSync();
-              sessionStoreCache.releaseRef(sessionId);
-            }
-          },
-          evict: (sessionId) => {
-            void sessionStoreCache.releaseIfIdle(sessionId);
+            return (
+              eagerSyncWorkerClient?.prefetch(getSessionRoomId(sessionId), lastMessageAt, signal) ??
+              'skipped'
+            );
           },
         },
         env: {
           isOnline: () => isBrowserOnline(),
           isAppVisible: () =>
-            typeof document === 'undefined' || document.visibilityState === 'visible',
+            !jotaiStore.get(navigationSidebarHiddenAtom) &&
+            (typeof document === 'undefined' || document.visibilityState === 'visible'),
           subscribe: (onChange) => {
             backgroundSyncEnvListeners.add(onChange);
+            const unsubscribeSidebar = jotaiStore.sub(navigationSidebarHiddenAtom, onChange);
             return () => {
+              unsubscribeSidebar();
               backgroundSyncEnvListeners.delete(onChange);
             };
           },
@@ -4333,6 +4439,8 @@ export async function createWorkspaceRuntime(deps: RuntimeDeps): Promise<Workspa
       backgroundSyncCoordinator = null;
       backgroundSyncHighWaterStore?.close();
       backgroundSyncHighWaterStore = null;
+      eagerSyncWorkerClient?.dispose();
+      eagerSyncWorkerClient = null;
       localReconnectLoop?.stop();
       cloudReconnectLoop?.stop();
       if (reconnectBackstopTimer) {
@@ -4585,6 +4693,7 @@ export async function createWorkspaceRuntime(deps: RuntimeDeps): Promise<Workspa
     getMachineAcpBinaryProgress,
     requestSessionCancel,
     requestSessionSteer,
+    requestSessionGoal,
     requestSessionTerminate,
     requestSessionFork,
     requestSessionEditAndResend,

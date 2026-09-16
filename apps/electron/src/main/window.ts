@@ -1,5 +1,6 @@
 import { app, BrowserWindow, dialog, nativeTheme, shell } from 'electron'
 import { is } from '@electron-toolkit/utils'
+import { installContextMenu } from './context-menu'
 import { join } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import {
@@ -7,7 +8,8 @@ import {
   getMainWindow,
   isAppQuitting,
   isWindowsTrayAvailable,
-  setMainWindow
+  setMainWindow,
+  productWindows
 } from './window-state'
 import {
   getMainWindowConstructorOptions,
@@ -21,6 +23,9 @@ import {
 } from './window-theme'
 import { formatUnknownError, normalizeExternalHttpUrl } from './utils'
 import { describeDeepLinkForAuthDebug } from './auth-debug'
+import { captureElectronMainException } from './posthog-error-reporting'
+import { createRendererProcessGoneHandling } from './renderer-process-gone'
+import { resolveMainWindowRuntimePolicy } from './window-runtime-policy'
 import { serializePreferredSystemLanguagesArgument } from '../system-language-argument'
 import {
   clearMountWatchdog,
@@ -37,9 +42,12 @@ import {
   type RecoveryContext
 } from './renderer-recovery'
 
+let productWindowIcon = ''
+
 type CreateMainWindowOptions = {
-  icon: string
-  initialPath?: '/' | '/onboarding'
+  icon?: string
+  initialPath?: string
+  auxiliary?: boolean
   hideWindowOnAutoLaunch?: boolean
   onDidFinishLoad?: () => void
 }
@@ -130,7 +138,7 @@ function formatLoadFailure(details: LoadFailureDetails): string {
   ].join('\n')
 }
 
-function resolveMainRendererTarget(initialPath: '/' | '/onboarding' = '/'): ReloadTarget {
+function resolveMainRendererTarget(initialPath = '/'): ReloadTarget {
   if (is.dev && process.env['ELECTRON_RENDERER_URL']) {
     return {
       type: 'url',
@@ -306,14 +314,18 @@ function attachMainWindowDiagnostics(window: BrowserWindow, recoveryTarget: Relo
       reason: details.reason,
       exitCode: details.exitCode
     })
-    // 'clean-exit' is normal shutdown — don't surface it.
-    if (details.reason === 'clean-exit') return
     if (isInRecovery(window)) return
-    showRecovery({
-      message: 'The Lody window crashed.',
-      details: `Reason: ${details.reason}\nExit code: ${details.exitCode}`,
-      source: 'render-process-gone'
+    const handling = createRendererProcessGoneHandling(details)
+    if (!handling) return
+
+    // This executes in main because the crashing renderer cannot finish its own
+    // telemetry request. The recovery page stays open afterwards, so this
+    // best-effort flush is never raced by an automatic product reload.
+    void captureElectronMainException(handling.report.error, {
+      component: handling.report.component,
+      extra: handling.report.extra
     })
+    showRecovery(handling.recovery)
   })
 
   webContents.on('devtools-opened', () => {
@@ -328,15 +340,25 @@ function attachMainWindowDiagnostics(window: BrowserWindow, recoveryTarget: Relo
 }
 
 export function createMainWindow(options: CreateMainWindowOptions): BrowserWindow {
-  const shouldMaximizeOnLaunch = shouldMaximizeMainWindowOnLaunch()
-  nativeTheme.themeSource = getInitialMainWindowThemeSource(options.initialPath)
+  const shouldMaximizeOnLaunch = !options.auxiliary && shouldMaximizeMainWindowOnLaunch()
+  const runtimePolicy = resolveMainWindowRuntimePolicy({
+    isPackaged: app.isPackaged,
+    e2eFlag: process.env['LODY_E2E'],
+    showE2EWindowFlag: process.env['LODY_E2E_SHOW_WINDOW']
+  })
+  if (options.icon) productWindowIcon = options.icon
+  if (!options.auxiliary)
+    nativeTheme.themeSource = getInitialMainWindowThemeSource(
+      options.initialPath === '/onboarding' ? '/onboarding' : '/'
+    )
   const resolvedTheme = nativeTheme.shouldUseDarkColors ? 'dark' : 'light'
   const window = new BrowserWindow({
     ...getMainWindowConstructorOptions(),
+    ...(options.auxiliary ? { width: 1000, height: 760 } : {}),
     show: false,
     backgroundColor: getMainWindowBackgroundColor(resolvedTheme),
     autoHideMenuBar: true,
-    ...(process.platform === 'linux' ? { icon: options.icon } : {}),
+    ...(process.platform === 'linux' ? { icon: productWindowIcon } : {}),
     ...(process.platform === 'darwin'
       ? { titleBarStyle: 'hiddenInset', trafficLightPosition: { x: 20, y: 16 } }
       : {}),
@@ -351,6 +373,7 @@ export function createMainWindow(options: CreateMainWindowOptions): BrowserWindo
       : {}),
     webPreferences: {
       preload: join(__dirname, '../preload/index.js'),
+      backgroundThrottling: runtimePolicy.backgroundThrottling,
       // Chromium's packaged locale resources are intentionally English-only.
       // Carry Electron's OS-level preference into preload so first-run product
       // language detection does not mistake the available .pak for user intent.
@@ -365,15 +388,37 @@ export function createMainWindow(options: CreateMainWindowOptions): BrowserWindo
   if (options.hideWindowOnAutoLaunch && shouldMaximizeOnLaunch) {
     pendingInitialMaximize.add(window)
   }
-  trackMainWindowState(window)
+  productWindows.add(window)
+  window.once('closed', () => {
+    productWindows.delete(window)
+    if (getMainWindow() === window) {
+      setMainWindow([...productWindows].find((candidate) => !candidate.isDestroyed()) ?? null)
+    }
+  })
+  if (!options.auxiliary) trackMainWindowState(window)
   const mainTarget = resolveMainRendererTarget(options.initialPath)
   const recoveryTarget = resolveRecoveryTarget()
   installNavigationGuard(window, [mainTarget, recoveryTarget])
+  installContextMenu(window)
   setReloadTarget(window, mainTarget)
   attachMainWindowDiagnostics(window, recoveryTarget)
 
+  // Push fullscreen state to the renderer so it can collapse the macOS
+  // traffic-light insets (sidebar header, top-bar padding, drag strip) while
+  // the lights are auto-hidden in native fullscreen.
+  const sendFullscreenState = () => {
+    if (!window.isDestroyed()) {
+      window.webContents.send('app.fullscreen', window.isFullScreen())
+    }
+  }
+  window.on('enter-full-screen', sendFullscreenState)
+  window.on('leave-full-screen', sendFullscreenState)
+
   window.on('ready-to-show', () => {
     if (options.hideWindowOnAutoLaunch) {
+      return
+    }
+    if (!runtimePolicy.showWhenReady) {
       return
     }
     if (shouldMaximizeOnLaunch) {
@@ -475,17 +520,6 @@ export function openMainWindow(options: OpenMainWindowOptions): BrowserWindow {
 
   setMainWindow(window)
 
-  // Push fullscreen state to the renderer so it can collapse the macOS
-  // traffic-light insets (sidebar header, top-bar padding, drag strip) while
-  // the lights are auto-hidden in native fullscreen.
-  const sendFullscreenState = () => {
-    if (!window.isDestroyed()) {
-      window.webContents.send('app.fullscreen', window.isFullScreen())
-    }
-  }
-  window.on('enter-full-screen', sendFullscreenState)
-  window.on('leave-full-screen', sendFullscreenState)
-
   window.on('close', (event) => {
     if (isAppQuitting()) {
       return
@@ -514,12 +548,6 @@ export function openMainWindow(options: OpenMainWindowOptions): BrowserWindow {
     }
 
     window.hide()
-  })
-
-  window.on('closed', () => {
-    if (getMainWindow() === window) {
-      setMainWindow(null)
-    }
   })
 
   return window

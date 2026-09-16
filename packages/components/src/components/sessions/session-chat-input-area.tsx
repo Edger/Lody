@@ -12,7 +12,8 @@ import {
   type MutableRefObject,
 } from 'react';
 import { useAtomValue } from 'jotai';
-import { ArrowUp, Loader2 } from 'lucide-react';
+import { ArrowUp } from 'lucide-react';
+import { Spinner } from '@/ui/spinner';
 import { Button } from '@/ui/button';
 import type { AcpSessionSelectOption } from '@/components/shared/acp-session-select';
 import { useSessionAgentRole, type SessionAgentRoleControl } from '@/hooks/use-session-agent-role';
@@ -41,6 +42,7 @@ import {
 } from '@/components/chat/chat-composer';
 import type { CombinedMentionTextareaHandle } from '@/components/mentions/combined-mention-textarea';
 import type { AttachmentAddMenuMcp } from '@/components/chat/attachment-add-menu';
+import { useComposerSubmission } from '@/components/chat/submission/use-composer-submission';
 import { MobileSessionRunConfig } from '@/components/mobile/mobile-session-run-config';
 import type { MentionProjectSource } from '@/components/mentions/mention-project-file-source';
 import {
@@ -100,6 +102,7 @@ import {
   resolveSessionRepoFullName,
 } from '@/lib/session-local-file-source';
 import { resolveEffectiveCodeCollabWorkspaceId } from '@/lib/code-collab-workspace-id';
+import { getDroppedFileLocalPath, toPathMentionInsertion } from '@/lib/dropped-local-path';
 import { isImeComposingKeyboardEvent } from '@/lib/ime';
 import { toast } from 'sonner';
 import { uploadSessionImage, validateSessionImageFile } from '@/lib/session-image-upload';
@@ -119,9 +122,12 @@ import { SESSION_FILE_MAX_COUNT, SESSION_IMAGE_MAX_SIZE_BYTES } from '@lody/shar
 import type { SessionFilePayload } from '@lody/shared';
 import {
   arePastedTextDraftsEqual,
+  getPastedTextByteSize,
   getPastedTextCharacterCount,
   getPastedTextDraftsAfterInsertion,
   insertPastedTextDraft,
+  isPastedTextTooLarge,
+  MAX_PASTED_TEXT_BYTE_SIZE,
   normalizePastedTextDraft,
   shouldCapturePastedTextDraft,
   type PastedTextDraft,
@@ -377,6 +383,8 @@ export function getSessionChatInputAreaShellClassName({
 }
 
 export interface SessionChatInputAreaProps {
+  /** Claims a one-shot navigation focus request; absent for ordinary session visits. */
+  claimNavigationFocus?: () => boolean;
   session: SessionMeta;
   sessionLocalProjectRootPath: string | null;
   isMachineRemoved: boolean;
@@ -475,6 +483,8 @@ export type SessionChatInputAreaHandle = {
   addVisualAnnotationReference: (reference: VisualAnnotationReferencePayload) => boolean;
   toggleVisualAnnotationReference: (reference: VisualAnnotationReferencePayload) => boolean;
   handleImageDrop: (files: File[]) => void;
+  /** Folders dropped from the OS; each becomes a `@<absolute path>` mention. */
+  handleDirectoryDrop: (directories: File[]) => void;
   /**
    * Mention another conversation in this draft. Returns false when nothing was
    * written (archived draft, unknown/own session, already mentioned), so the
@@ -491,6 +501,7 @@ export const SessionChatInputArea = memo(
   forwardRef<SessionChatInputAreaHandle, SessionChatInputAreaProps>(function SessionChatInputArea(
     {
       session,
+      claimNavigationFocus,
       sessionLocalProjectRootPath,
       isMachineRemoved,
       canStopAgent = false,
@@ -574,6 +585,11 @@ export const SessionChatInputArea = memo(
     const postHog = usePostHog();
     const isArchived = session.isArchived === true;
     const textareaRef = useRef<HTMLTextAreaElement>(null);
+    useLayoutEffect(() => {
+      if (claimNavigationFocus?.() && !usesMobileKeyboardAction) {
+        textareaRef.current?.focus({ preventScroll: true });
+      }
+    }, [claimNavigationFocus, usesMobileKeyboardAction]);
     const agentRoleTurnSelectionRef = useRef<SessionTurnAgentRoleSelection>(undefined);
     const selectedAgentRoleRef = useRef<AgentRole | undefined>(undefined);
     const agentRoleRunConfigRef = useRef({
@@ -581,11 +597,6 @@ export const SessionChatInputArea = memo(
       modelId: selectedModelId,
       configOptionValues: configOptionValues ?? {},
     });
-    const restoreFocusAfterRejectedMobileSendRef = useRef(false);
-    /** Session id that initiated the pending desktop focus restore. */
-    const pendingDesktopFocusRestoreSessionIdRef = useRef<string | null>(null);
-    /** The textarea element that was active when the send started. */
-    const pendingFocusRestoreTextareaRef = useRef<HTMLTextAreaElement | null>(null);
     const attachmentInputRef = useRef<HTMLInputElement>(null);
     const activeSessionIdRef = useRef(session.id);
     activeSessionIdRef.current = session.id;
@@ -777,7 +788,7 @@ export const SessionChatInputArea = memo(
     // The visible draft can move into an in-flight submission immediately while
     // its actual state stays intact until the durable writer accepts it. A
     // rejected send simply reveals the preserved draft again.
-    const [submissionPending, setSubmissionPending] = useState(false);
+    const { submissionPending, beginSubmission } = useComposerSubmission(session.id, textareaRef);
     const expandPromptMentionsRef = useRef<
       (args: MentionPromptExpansionArgs) => ExpandedMentionPrompt
     >(({ text }) => ({ text }));
@@ -815,7 +826,6 @@ export const SessionChatInputArea = memo(
     const [prevSessionId, setPrevSessionId] = useState(session.id);
     if (prevSessionId !== session.id) {
       setPrevSessionId(session.id);
-      setSubmissionPending(false);
       const cached = sessionDraftsCache.get(session.id) ?? initialInputText ?? '';
       setUserInputState(cached);
       setPendingImages(getSessionImageDrafts(session.id));
@@ -1139,7 +1149,7 @@ export const SessionChatInputArea = memo(
 
     const startFileUpload = useCallback(
       async (targetSessionId: SessionId, localId: string, file: File) => {
-        if (!workspaceId || !authToken) {
+        if (!workspaceId) {
           updatePendingFile(targetSessionId, localId, (entry) => ({
             ...entry,
             status: 'failed',
@@ -1177,6 +1187,16 @@ export const SessionChatInputArea = memo(
           } catch {
             // Local handoff threw; fall back to the cloud upload path.
           }
+        }
+
+        if (!authToken) {
+          updatePendingFile(targetSessionId, localId, (entry) => ({
+            ...entry,
+            status: 'failed',
+            progress: 0,
+            error: fileUploadMissingAuthLabel,
+          }));
+          return;
         }
 
         const abort = new AbortController();
@@ -1608,6 +1628,25 @@ export const SessionChatInputArea = memo(
         }
         const text = event.clipboardData.getData('text/plain');
 
+        // Refuse the whole paste rather than silently truncating it: a blob this
+        // large is a log dump, and a half-pasted log is worse than none.
+        if (text && isPastedTextTooLarge(text)) {
+          event.preventDefault();
+          toast.error(
+            t('composer.pastedTextTooLarge', 'Pasted text is too large ({{size}}).', {
+              size: formatFileSize(getPastedTextByteSize(text)),
+            }),
+            {
+              description: t(
+                'composer.pastedTextTooLargeDescription',
+                'The limit is {{limit}}. Attach it as a file instead.',
+                { limit: formatFileSize(MAX_PASTED_TEXT_BYTE_SIZE) }
+              ),
+            }
+          );
+          return;
+        }
+
         if (text && shouldCapturePastedTextDraft(text)) {
           event.preventDefault();
           if (insertLargePastedTextAtSelection(text)) {
@@ -1644,6 +1683,7 @@ export const SessionChatInputArea = memo(
         handleAddFiles,
         insertLargePastedTextAtSelection,
         isArchived,
+        t,
       ]
     );
     const handleImageDrop = useCallback(
@@ -1663,6 +1703,19 @@ export const SessionChatInputArea = memo(
         }
       },
       [disableImageUpload, enqueueFileAttachments, handleAddFiles, isArchived]
+    );
+    const handleDirectoryDrop = useCallback(
+      (directories: File[]) => {
+        if (isArchived) {
+          return;
+        }
+        const insertions = directories.flatMap((directory) => {
+          const localPath = getDroppedFileLocalPath(directory);
+          return localPath ? [toPathMentionInsertion(localPath, 'dir')] : [];
+        });
+        mentionActionsRef.current?.insertPathMentions(insertions);
+      },
+      [isArchived]
     );
 
     const insertSessionMention = useCallback(
@@ -1687,6 +1740,7 @@ export const SessionChatInputArea = memo(
         addVisualAnnotationReference,
         toggleVisualAnnotationReference,
         handleImageDrop,
+        handleDirectoryDrop,
         insertSessionMention,
         getAgentRoleSelection: (runConfigOverrides) =>
           resolveTurnAgentRoleForRunConfig({
@@ -1703,6 +1757,7 @@ export const SessionChatInputArea = memo(
         addVisualAnnotationReference,
         toggleVisualAnnotationReference,
         handleImageDrop,
+        handleDirectoryDrop,
         insertSessionMention,
       ]
     );
@@ -1725,263 +1780,202 @@ export const SessionChatInputArea = memo(
       [pastedTextDrafts, session.id, updatePastedTextDraftsForSession]
     );
 
-    const sendMessage = useCallback(
-      async (source: 'keyboard' | 'button' = 'button') => {
-        if (freeTurnLimitNotice && freeTurnLimitNotice.current >= freeTurnLimitNotice.limit) {
-          capturePostHogEvent(postHog, 'session/input_blocked', {
-            reason: 'free_session_turn_limit_reached',
-            entrypoint: 'session_chat',
-            project_kind: sessionProjectKind,
-            workspace_id: workspaceId ?? null,
-            session_id: session.id,
-          });
-          return;
-        }
-        if (isArchived) {
-          capturePostHogEvent(postHog, 'session/input_blocked', {
-            reason: 'session_archived',
-            entrypoint: 'session_chat',
-            project_kind: sessionProjectKind,
-            has_pending_images: pendingImages.length > 0,
-            workspace_id: workspaceId ?? null,
-            session_id: session.id,
-          });
-          return;
-        }
-        if (durableAgentRoleReady === false) {
-          return;
-        }
-        if (isMachineRemoved) {
-          capturePostHogEvent(postHog, 'session/input_blocked', {
-            reason: 'machine_removed',
-            entrypoint: 'session_chat',
-            project_kind: sessionProjectKind,
-            has_pending_images: pendingImages.length > 0,
-            workspace_id: workspaceId ?? null,
-            session_id: session.id,
-          });
-          return;
-        }
-        if (isExternalHistoryRefreshing) {
-          capturePostHogEvent(postHog, 'session/input_blocked', {
-            reason: 'external_history_syncing',
-            entrypoint: 'session_chat',
-            project_kind: sessionProjectKind,
-            has_pending_images: pendingImages.length > 0,
-            workspace_id: workspaceId ?? null,
-            session_id: session.id,
-          });
-          return;
-        }
-        const currentValue = textareaRef.current?.value ?? userInput;
-        // One pass: pasted placeholders, `$skill`, `@session:`, and the mentions
-        // that need no rewrite all resolve against the same original text, and
-        // the spans record where each landed.
-        const expandedPrompt = expandPromptMentionsRef.current({
-          text: currentValue,
-          mentions: mentionRangesRef.current,
-          pastedTextDrafts,
+    const sendMessage = useCallback(async () => {
+      if (freeTurnLimitNotice && freeTurnLimitNotice.current >= freeTurnLimitNotice.limit) {
+        capturePostHogEvent(postHog, 'session/input_blocked', {
+          reason: 'free_session_turn_limit_reached',
+          entrypoint: 'session_chat',
+          project_kind: sessionProjectKind,
+          workspace_id: workspaceId ?? null,
+          session_id: session.id,
         });
-        const trimmedPrompt = expandedPrompt.text.trim();
-        // The trim moves every character left; re-anchor before the offsets ship.
-        const trimmedSpans = reanchorMessageTextSpansForTrim(
-          expandedPrompt.text,
-          trimmedPrompt,
-          expandedPrompt.spans
-        );
-        const textBlocks: SessionInputBlock[] = trimmedPrompt
-          ? [
-              {
-                type: 'text',
-                text: trimmedPrompt,
-                ...(trimmedSpans ? { spans: trimmedSpans } : {}),
-              },
-            ]
-          : [];
-        const uploadedImages = pendingImages
-          .filter((image): image is PendingImage & { uploaded: SessionImagePayload } => {
-            return image.status === 'uploaded' && !!image.uploaded;
-          })
-          .map((image) => toImageInputBlock(image.uploaded));
-        const hasBlockingImages = pendingImages.some((image) => image.status !== 'uploaded');
-        // A still-uploading file (not failed) blocks send; failed ones are
-        // skipped so a single failed attachment doesn't trap the message.
-        const hasBlockingFiles = pendingFiles.some((file) =>
-          isSessionFileTransferPhase(file.status)
-        );
-        const uploadedFiles = pendingFiles
-          .filter((file): file is PendingFile & { uploaded: SessionFilePayload } => {
-            return file.status === 'uploaded' && !!file.uploaded;
-          })
-          .map((file) => toFileInputBlock(file.uploaded));
-        if (hasBlockingImages || hasBlockingFiles) {
-          capturePostHogEvent(postHog, 'session/input_blocked', {
-            reason: 'image_upload_in_progress',
-            entrypoint: 'session_chat',
-            project_kind: sessionProjectKind,
-            has_pending_images: true,
-            workspace_id: workspaceId ?? null,
-            session_id: session.id,
-          });
-          return;
-        }
-        const commentRefBlocks: SessionInputBlock[] = commentReferencesRef.current.map((item) => ({
-          type: 'comment_reference' as const,
+        return;
+      }
+      if (isArchived) {
+        capturePostHogEvent(postHog, 'session/input_blocked', {
+          reason: 'session_archived',
+          entrypoint: 'session_chat',
+          project_kind: sessionProjectKind,
+          has_pending_images: pendingImages.length > 0,
+          workspace_id: workspaceId ?? null,
+          session_id: session.id,
+        });
+        return;
+      }
+      if (durableAgentRoleReady === false) {
+        return;
+      }
+      if (isMachineRemoved) {
+        capturePostHogEvent(postHog, 'session/input_blocked', {
+          reason: 'machine_removed',
+          entrypoint: 'session_chat',
+          project_kind: sessionProjectKind,
+          has_pending_images: pendingImages.length > 0,
+          workspace_id: workspaceId ?? null,
+          session_id: session.id,
+        });
+        return;
+      }
+      if (isExternalHistoryRefreshing) {
+        capturePostHogEvent(postHog, 'session/input_blocked', {
+          reason: 'external_history_syncing',
+          entrypoint: 'session_chat',
+          project_kind: sessionProjectKind,
+          has_pending_images: pendingImages.length > 0,
+          workspace_id: workspaceId ?? null,
+          session_id: session.id,
+        });
+        return;
+      }
+      const currentValue = textareaRef.current?.value ?? userInput;
+      // One pass: pasted placeholders, `$skill`, `@session:`, and the mentions
+      // that need no rewrite all resolve against the same original text, and
+      // the spans record where each landed.
+      const expandedPrompt = expandPromptMentionsRef.current({
+        text: currentValue,
+        mentions: mentionRangesRef.current,
+        pastedTextDrafts,
+      });
+      const trimmedPrompt = expandedPrompt.text.trim();
+      // The trim moves every character left; re-anchor before the offsets ship.
+      const trimmedSpans = reanchorMessageTextSpansForTrim(
+        expandedPrompt.text,
+        trimmedPrompt,
+        expandedPrompt.spans
+      );
+      const textBlocks: SessionInputBlock[] = trimmedPrompt
+        ? [
+            {
+              type: 'text',
+              text: trimmedPrompt,
+              ...(trimmedSpans ? { spans: trimmedSpans } : {}),
+            },
+          ]
+        : [];
+      const uploadedImages = pendingImages
+        .filter((image): image is PendingImage & { uploaded: SessionImagePayload } => {
+          return image.status === 'uploaded' && !!image.uploaded;
+        })
+        .map((image) => toImageInputBlock(image.uploaded));
+      const hasBlockingImages = pendingImages.some((image) => image.status !== 'uploaded');
+      // A still-uploading file (not failed) blocks send; failed ones are
+      // skipped so a single failed attachment doesn't trap the message.
+      const hasBlockingFiles = pendingFiles.some((file) => isSessionFileTransferPhase(file.status));
+      const uploadedFiles = pendingFiles
+        .filter((file): file is PendingFile & { uploaded: SessionFilePayload } => {
+          return file.status === 'uploaded' && !!file.uploaded;
+        })
+        .map((file) => toFileInputBlock(file.uploaded));
+      if (hasBlockingImages || hasBlockingFiles) {
+        capturePostHogEvent(postHog, 'session/input_blocked', {
+          reason: 'image_upload_in_progress',
+          entrypoint: 'session_chat',
+          project_kind: sessionProjectKind,
+          has_pending_images: true,
+          workspace_id: workspaceId ?? null,
+          session_id: session.id,
+        });
+        return;
+      }
+      const commentRefBlocks: SessionInputBlock[] = commentReferencesRef.current.map((item) => ({
+        type: 'comment_reference' as const,
+        ...item.reference,
+      }));
+      const visualAnnotationRefBlocks: SessionInputBlock[] =
+        visualAnnotationReferencesRef.current.map((item) => ({
+          type: 'visual_annotation_reference' as const,
           ...item.reference,
         }));
-        const visualAnnotationRefBlocks: SessionInputBlock[] =
-          visualAnnotationReferencesRef.current.map((item) => ({
-            type: 'visual_annotation_reference' as const,
-            ...item.reference,
-          }));
-        const submittedVisualAnnotationReferences = visualAnnotationReferencesRef.current.map(
-          (item) => item.reference
-        );
+      const submittedVisualAnnotationReferences = visualAnnotationReferencesRef.current.map(
+        (item) => item.reference
+      );
 
-        if (
-          textBlocks.length === 0 &&
-          uploadedImages.length === 0 &&
-          uploadedFiles.length === 0 &&
-          commentRefBlocks.length === 0 &&
-          visualAnnotationRefBlocks.length === 0
-        ) {
-          capturePostHogEvent(postHog, 'session/input_blocked', {
-            reason: 'empty_input',
-            entrypoint: 'session_chat',
-            project_kind: sessionProjectKind,
-            has_pending_images: false,
-            workspace_id: workspaceId ?? null,
-            session_id: session.id,
-          });
-          return;
-        }
+      if (
+        textBlocks.length === 0 &&
+        uploadedImages.length === 0 &&
+        uploadedFiles.length === 0 &&
+        commentRefBlocks.length === 0 &&
+        visualAnnotationRefBlocks.length === 0
+      ) {
+        capturePostHogEvent(postHog, 'session/input_blocked', {
+          reason: 'empty_input',
+          entrypoint: 'session_chat',
+          project_kind: sessionProjectKind,
+          has_pending_images: false,
+          workspace_id: workspaceId ?? null,
+          session_id: session.id,
+        });
+        return;
+      }
 
-        const inputBlocks: SessionInputBlock[] = [
-          ...commentRefBlocks,
-          ...visualAnnotationRefBlocks,
-          ...uploadedImages,
-          ...uploadedFiles,
-          ...textBlocks,
-        ];
-        const dismissKeyboardForSubmit =
-          usesMobileKeyboardAction && (source === 'keyboard' || source === 'button');
-        // Snapshot the textarea and session id BEFORE the await so the
-        // post-commit focus-restore effect can verify neither changed during
-        // the in-flight send. Capturing after the await would miss a session
-        // switch that happened while the send was pending.
-        const textareaBeforeSend = textareaRef.current;
-        const sessionIdBeforeSend = session.id;
-        if (dismissKeyboardForSubmit) {
-          // The mobile Send action should dismiss the soft keyboard at the same
-          // immediate handoff boundary as the visible draft, not after the
-          // asynchronous local writer accepts the turn.
-          textareaRef.current?.blur();
-        }
-        setSubmissionPending(true);
-        // React still owns the preserved draft state. Clear only the visible DOM
-        // immediately so Enter/click feedback does not wait for local IPC.
-        if (textareaRef.current) {
-          textareaRef.current.value = '';
-        }
-        let accepted = false;
-        try {
-          accepted = await onSendMessage(inputBlocks, agentRoleTurnSelectionRef.current);
-          if (accepted) {
+      const inputBlocks: SessionInputBlock[] = [
+        ...commentRefBlocks,
+        ...visualAnnotationRefBlocks,
+        ...uploadedImages,
+        ...uploadedFiles,
+        ...textBlocks,
+      ];
+      const submittedDraft = {
+        text: sessionDraftsCache.get(session.id),
+        images: sessionImageDraftsCache.get(session.id),
+        files: sessionFileDraftsCache.get(session.id),
+        pastedText: sessionPastedTextDraftsCache.get(session.id),
+      };
+      const submission = beginSubmission({ dismissKeyboard: usesMobileKeyboardAction });
+      if (!submission) return;
+      try {
+        const accepted = await onSendMessage(inputBlocks, agentRoleTurnSelectionRef.current);
+        if (accepted) {
+          if (submission.isCurrent()) {
             clearInput();
             clearPendingImages();
             clearPendingFiles();
             updatePastedTextDraftsForSession(session.id, () => []);
             publishCommentReferences([]);
             publishVisualAnnotationReferences([]);
-            if (submittedVisualAnnotationReferences.length > 0) {
-              void onVisualAnnotationReferencesSubmitted?.(submittedVisualAnnotationReferences);
-            }
+          } else if (
+            sessionDraftsCache.get(session.id) === submittedDraft.text &&
+            sessionImageDraftsCache.get(session.id) === submittedDraft.images &&
+            sessionFileDraftsCache.get(session.id) === submittedDraft.files &&
+            sessionPastedTextDraftsCache.get(session.id) === submittedDraft.pastedText
+          ) {
+            // Acceptance retires the original cached draft even after unmount.
+            // A later edit owns a different snapshot and must survive. Never
+            // write component state from a retired submission.
+            clearSessionChatInputDrafts(session.id);
           }
-        } finally {
-          restoreFocusAfterRejectedMobileSendRef.current = dismissKeyboardForSubmit && !accepted;
-          if (!dismissKeyboardForSubmit) {
-            // Stash the pre-send snapshot for the focus-restore effect below.
-            pendingDesktopFocusRestoreSessionIdRef.current = sessionIdBeforeSend;
-            pendingFocusRestoreTextareaRef.current = textareaBeforeSend;
+          if (submittedVisualAnnotationReferences.length > 0) {
+            void onVisualAnnotationReferencesSubmitted?.(submittedVisualAnnotationReferences);
           }
-          setSubmissionPending(false);
-          // Focus is NOT restored synchronously here: the textarea is still
-          // disabled (React has not yet committed the re-render that clears
-          // submissionPending). The desktop focus-restore useEffect below
-          // handles it after the re-enable render.
         }
-      },
-      [
-        clearInput,
-        clearPendingImages,
-        clearPendingFiles,
-        freeTurnLimitNotice,
-        isArchived,
-        durableAgentRoleReady,
-        isExternalHistoryRefreshing,
-        isMachineRemoved,
-        onSendMessage,
-        onVisualAnnotationReferencesSubmitted,
-        pendingFiles,
-        pendingImages,
-        pastedTextDrafts,
-        publishCommentReferences,
-        publishVisualAnnotationReferences,
-        postHog,
-        session.id,
-        sessionProjectKind,
-        updatePastedTextDraftsForSession,
-        userInput,
-        usesMobileKeyboardAction,
-        workspaceId,
-      ]
-    );
-
-    useEffect(() => {
-      if (submissionPending || !restoreFocusAfterRejectedMobileSendRef.current) {
-        return;
+      } finally {
+        submission.finish();
       }
-      restoreFocusAfterRejectedMobileSendRef.current = false;
-      textareaRef.current?.focus();
-    }, [submissionPending]);
-    // Desktop focus restore: runs after submissionPending flips to false AND
-    // the textarea re-renders as enabled. Verifies that:
-    //   1. The session has not changed since the send started (compares the
-    //      stored session id with the current one).
-    //   2. The textarea DOM element is still the one that initiated the send
-    //      (guards against session switches that replace the textarea).
-    //   3. No other interactive control owns focus. Disabling the textarea
-    //      moves focus to document.body, so body !== textarea is the expected
-    //      state — only skip when a different interactive element has focus.
-    useEffect(() => {
-      if (submissionPending) return;
-      const storedSessionId = pendingDesktopFocusRestoreSessionIdRef.current;
-      if (storedSessionId === null) return;
-      pendingDesktopFocusRestoreSessionIdRef.current = null;
-
-      const targetTextarea = pendingFocusRestoreTextareaRef.current;
-      pendingFocusRestoreTextareaRef.current = null;
-
-      // Session changed while the send was in flight — the current textarea
-      // belongs to a different session, so do not touch it.
-      if (storedSessionId !== activeSessionIdRef.current) return;
-      // The textarea was replaced (e.g. session switch unmounted/remounted).
-      if (!targetTextarea || textareaRef.current !== targetTextarea) return;
-      // The user deliberately focused another interactive control during the
-      // wait. document.body is the default when the disabled textarea lost
-      // focus, so it does NOT count as the user moving focus elsewhere.
-      const active = document.activeElement;
-      if (
-        active &&
-        active !== document.body &&
-        active !== targetTextarea &&
-        active instanceof HTMLElement
-      ) {
-        return;
-      }
-
-      targetTextarea.focus();
-    }, [submissionPending]);
+    }, [
+      beginSubmission,
+      clearInput,
+      clearPendingImages,
+      clearPendingFiles,
+      freeTurnLimitNotice,
+      isArchived,
+      durableAgentRoleReady,
+      isExternalHistoryRefreshing,
+      isMachineRemoved,
+      onSendMessage,
+      onVisualAnnotationReferencesSubmitted,
+      pendingFiles,
+      pendingImages,
+      pastedTextDrafts,
+      publishCommentReferences,
+      publishVisualAnnotationReferences,
+      postHog,
+      session.id,
+      sessionProjectKind,
+      updatePastedTextDraftsForSession,
+      userInput,
+      usesMobileKeyboardAction,
+      workspaceId,
+    ]);
 
     const handleKeyDown = useCallback(
       (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
@@ -1998,7 +1992,7 @@ export const SessionChatInputArea = memo(
           return;
         }
         e.preventDefault();
-        void sendMessage('keyboard');
+        void sendMessage();
       },
       [mobileKeyboardAction, sendMessage, usesMobileKeyboardAction]
     );
@@ -2409,7 +2403,7 @@ export const SessionChatInputArea = memo(
     const externalHistorySyncNode =
       isExternalHistoryRefreshing && externalHistorySyncLabel ? (
         <div className="mb-2 inline-flex max-w-full items-center gap-1.5 rounded-md border border-border/60 bg-muted/60 px-2 py-1 text-xs text-muted-foreground">
-          <Loader2 className="h-3.5 w-3.5 shrink-0 animate-spin" aria-hidden="true" />
+          <Spinner className="h-3.5 w-3.5 shrink-0" aria-hidden="true" />
           <span className="truncate">{externalHistorySyncLabel}</span>
         </div>
       ) : null;
@@ -2458,7 +2452,7 @@ export const SessionChatInputArea = memo(
         type="button"
         size="icon"
         variant="ghost"
-        onClick={() => void sendMessage('button')}
+        onClick={() => void sendMessage()}
         disabled={!hasSendableContent || isSendActionDisabled}
         aria-label={
           isExternalHistoryRefreshing && externalHistorySyncLabel
@@ -2472,7 +2466,7 @@ export const SessionChatInputArea = memo(
         )}
       >
         {submissionPending || hasBlockingImages || isExternalHistoryRefreshing ? (
-          <Loader2 className={isMobile ? 'h-5 w-5 animate-spin' : 'h-4 w-4 animate-spin'} />
+          <Spinner className={isMobile ? 'h-5 w-5' : 'h-4 w-4'} />
         ) : (
           <ArrowUp className={isMobile ? 'h-5 w-5' : 'h-4 w-4'} />
         )}
@@ -2498,6 +2492,7 @@ export const SessionChatInputArea = memo(
         onPromptKeyDown={handleKeyDown}
         onPromptPaste={handlePaste}
         onImageDrop={!submissionPending && attachmentAddEnabled ? handleImageDrop : undefined}
+        onDirectoryDrop={handleDirectoryDrop}
         // The dropzone accepts files AND images, so it must NOT inherit the
         // image-only disable (which trips at 8 pending images). Per-type count
         // limits are enforced inside handleImageDrop's handlers. Drops are only
@@ -2554,9 +2549,15 @@ export const SessionChatInputArea = memo(
 
     return (
       <div
-        className={getSessionChatInputAreaShellClassName({
-          protectFromEdgeBackZone: isMobile,
-        })}
+        className={getSessionChatInputAreaShellClassName({ protectFromEdgeBackZone: isMobile })}
+        onMouseDown={(event) => {
+          // Keep the restored shell-owned bottom spacing focusable without
+          // stealing focus from selectors, attachments, or the prompt itself.
+          if (event.button === 0 && event.target === event.currentTarget) {
+            event.preventDefault();
+            textareaRef.current?.focus({ preventScroll: true });
+          }
+        }}
       >
         {/* The Role editor is a Dialog, so it is hosted OUT here rather than
             inside the run-config menu or the mobile drawer, where it would
