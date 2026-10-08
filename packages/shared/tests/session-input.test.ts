@@ -13,7 +13,6 @@ import {
   resolveSessionAcpRuntimeConfig,
   resolveSessionConversationConfig,
   resolveSessionConversationSourceFence,
-  resolveSessionTaskToolsEnabled,
 } from '../src/session-input';
 import { normalizeSessionTurnInputConfig, SessionFileBlockSchema } from '../src/message-schemas';
 import { sessionDocSchema } from '../src/schema';
@@ -292,32 +291,6 @@ describe('session-input helpers', () => {
         configOptionValues: { collaboration_mode: 'default' },
       })
     ).toBeNull();
-  });
-
-  it('resolves the frozen Task tool gate with legacy inputs disabled', () => {
-    expect(
-      resolveSessionTaskToolsEnabled([
-        {
-          id: 'turn-1',
-          role: 'user',
-          inputConfig: {
-            prompt: 'create a task',
-            cliType: 'builtin',
-            agentType: 'codex',
-            taskToolsEnabled: true,
-          },
-        },
-      ])
-    ).toBe(true);
-    expect(
-      resolveSessionTaskToolsEnabled([
-        {
-          id: 'legacy-turn',
-          role: 'user',
-          inputConfig: { prompt: 'hello', cliType: 'builtin', agentType: 'codex' },
-        },
-      ])
-    ).toBe(false);
   });
 
   it('ignores invalid and unconfigured history when resolving conversation config', () => {
@@ -740,6 +713,7 @@ describe('session-input helpers', () => {
     ).toEqual({
       userId: 'user-1',
       role: 'user',
+      author: { v: 1, kind: 'human', userId: 'user-1' },
       items: [
         { type: 'text', text: 'hello' },
         {
@@ -938,4 +912,51 @@ describe('session-input helpers', () => {
       mirror.dispose();
     }
   });
+});
+
+it('freezes a memory identity in turn input and restores the same identity from history', () => {
+  const memory = { providerId: 'nowledge-mem', memoryId: 'reviewer' };
+  const inputConfig = buildSessionTurnInputConfig({
+    prompt: 'Review this',
+    cliType: 'builtin',
+    agentType: 'codex',
+    memory,
+  });
+  const doc = new Loro();
+  const mirror = new Mirror({
+    doc,
+    schema: sessionDocSchema,
+    initialState: {
+      session: { id: 'memory-session' as SessionId },
+      history: [],
+      mq: [],
+    } satisfies Partial<SessionDoc>,
+    throwOnValidationError: true,
+  });
+  mirror.setState((prev) => ({
+    ...prev,
+    history: [{ id: 'memory-turn', role: 'user', inputConfig }],
+  }));
+  expect(
+    normalizeSessionTurnInputConfig(mirror.getState().history[0]?.inputConfig)?.memory
+  ).toEqual(memory);
+  mirror.dispose();
+  expect(
+    resolveSessionConversationConfig([{ id: 'turn-1', role: 'user', inputConfig }]).memory
+  ).toEqual(memory);
+  expect(
+    resolveSessionConversationConfig([
+      { id: 'turn-1', role: 'user', inputConfig },
+      {
+        id: 'turn-2',
+        role: 'user',
+        inputConfig: buildSessionTurnInputConfig({
+          prompt: 'Continue',
+          cliType: 'builtin',
+          agentType: 'codex',
+          agentRoleId: null,
+        }),
+      },
+    ]).memory
+  ).toBeUndefined();
 });

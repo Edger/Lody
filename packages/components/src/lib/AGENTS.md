@@ -1,10 +1,10 @@
 # Shared UI helpers and file surfaces
 
-`CLAUDE.md` is a symlink to this file. Edit `AGENTS.md` only.
-These rules also bind callers changing crash recovery, localStorage caches, file
-surfaces, or Electron IPC typing. Read the relevant sections before those changes.
-Rationale: [components](../../../../.agents/docs/components-package.md) and
-[file paths](../../../../.agents/docs/components-file-paths.md).
+Rules bind callers too.
+Background: [components](../../../../.agents/docs/components-package.md),
+[files](../../../../.agents/docs/components-file-paths.md).
+
+- Send acceptance and RPC await local commits, never Repo-wide flush.
 
 ## Electron IPC types
 
@@ -22,6 +22,8 @@ Rationale: [components](../../../../.agents/docs/components-package.md) and
 - `ErrorBoundary`'s `error-boundary-fallback.tsx` displays the real error and one-click
   full-report copy on every build. Details default visible (`showErrorDetails` opts out);
   `lib/error-boundary-report.ts` is the pure copy builder.
+- Error/not-found screens use `components/status-page.tsx`; pre-React `boot-failure.ts`
+  draws that column in plain DOM with copied V2 token values, never React/StyleX/Tailwind.
 - Crash screens never reload/restart/reset themselves. `resetKeys` must not clear a captured
   error; the copyable fallback stays visible until the user presses a recovery button.
 - A cloud query throws into render and keeps throwing. An optional surface inside a larger
@@ -74,16 +76,17 @@ Rationale: [components](../../../../.agents/docs/components-package.md) and
 - Preview and More-menu shell actions share `useSessionFileActions`. Only Electron
   on the session's own machine may invoke them; explicit local absolute artifact
   paths stay absolute, and remote paths never launch on the viewer's machine.
-- Native file sharing uses complete authorized preview bytes, never a remote host
-  path. Keep the existing transfer limits; stage each export in an isolated cache
-  file and clean up after cancellation, failure, or handoff.
+- Native file/PNG sharing uses complete authorized bytes, never host paths. Preserve
+  transfer limits; stage isolated cache files and clean up after handoff, failure, or
+  cancellation. Report cancellation separately; retain the preview and selection.
 
 ## File identity, caching, and errors
 
 - `session-file-open-target.ts` alone owns path normalization. Canonical workspace-relative
   paths (tree, quick open, mobile browser, LSP) travel verbatim. Only Markdown hrefs
   are URL-decoded and stripped of `:<line>` / `#L<line>` suffixes, absolute host
-  roots, and `.../worktrees/<uuid>/` prefixes.
+  roots; same-machine Electron preserves other worktree paths instead of stripping
+  `.../worktrees/<uuid>/` prefixes. Display shortening never rewrites click targets.
   Line anchors travel as fields, not inside paths.
 - Cache resolved opens under BOTH `response.path` (the save identity) and the requested
   path (viewer/change-check identity). After save, refresh EVERY `cacheKeys` alias.
@@ -115,3 +118,5 @@ Rationale: [components](../../../../.agents/docs/components-package.md) and
   `formatAgentRateLimitWindowLabel`, even when duration/utilization/reset match.
 - Before creating top-level or child sessions, call `filterAcpSessionConfigOptionValues()`
   so cached values outside the current selector schema are neither dispatched nor persisted.
+
+Attachment transfer lifecycle changes follow [workspace ownership](../providers/AGENTS.md#attachment-transfer-ownership).

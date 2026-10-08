@@ -1,9 +1,8 @@
-import { useAtomValue } from 'jotai';
-import { promptShortcutsFeatureEnabledAtom } from '@/atoms/settings';
 import type { LucideIcon } from 'lucide-react';
 import type { PlatformCapability } from '@lody/platform';
 import { useAppCapabilityCheck } from '../../lib/app-platform';
 import {
+  Brain,
   Bot,
   Building2,
   ChartNoAxesCombined,
@@ -34,6 +33,7 @@ export type SettingsTabId =
   | 'people'
   | 'machines'
   | 'agents'
+  | 'memory'
   | 'agent-roles'
   | 'prompt-shortcuts'
   | 'mcp'
@@ -53,6 +53,7 @@ export type SettingsPath =
   | '/$workspaceName/settings/people'
   | '/$workspaceName/settings/machines'
   | '/$workspaceName/settings/agents'
+  | '/$workspaceName/settings/memory'
   | '/$workspaceName/settings/agent-roles'
   | '/$workspaceName/settings/prompt-shortcuts'
   | '/$workspaceName/settings/mcp'
@@ -72,6 +73,8 @@ export type SettingsTabConfig = {
   capability?: PlatformCapability;
   /** The workspace machine inventory has no useful distinction in a solo workspace. */
   multiMemberOnly?: boolean;
+  /** Keyboard-centric surfaces are hidden from the mobile settings list. */
+  desktopOnly?: boolean;
   path: SettingsPath;
 };
 
@@ -109,6 +112,7 @@ export const SETTINGS_TAB_CONFIGS: SettingsTabConfig[] = [
     labelKey: 'settings.tabs.keyboardShortcuts',
     descriptionKey: 'settings.categories.keyboardShortcuts.description',
     icon: Keyboard,
+    desktopOnly: true,
     path: '/$workspaceName/settings/keyboard-shortcuts',
   },
   {
@@ -146,6 +150,14 @@ export const SETTINGS_TAB_CONFIGS: SettingsTabConfig[] = [
     descriptionKey: 'settings.categories.agentRoles.description',
     icon: UserRoundCog,
     path: '/$workspaceName/settings/agent-roles',
+  },
+  {
+    id: 'memory',
+    section: 'workspace',
+    labelKey: 'settings.tabs.memory',
+    descriptionKey: 'settings.memory.description',
+    icon: Brain,
+    path: '/$workspaceName/settings/memory',
   },
   {
     id: 'mcp',
@@ -220,12 +232,10 @@ export const SETTINGS_TAB_CONFIGS: SettingsTabConfig[] = [
 export function useVisibleSettingsTabs(options?: {
   includeMultiMemberOnly?: boolean;
 }): SettingsTabConfig[] {
-  const promptShortcutsEnabled = useAtomValue(promptShortcutsFeatureEnabledAtom);
   const hasCapability = useAppCapabilityCheck();
   const includeMultiMemberOnly = options?.includeMultiMemberOnly ?? true;
   return SETTINGS_TAB_CONFIGS.filter(
     (tab) =>
-      (tab.id !== 'prompt-shortcuts' || promptShortcutsEnabled) &&
       (tab.capability === undefined || hasCapability(tab.capability)) &&
       (!tab.multiMemberOnly || includeMultiMemberOnly)
   );
@@ -246,6 +256,7 @@ export function getActiveSettingsTabId(pathname: string): SettingsTabId | null {
     ['/settings/devices', 'machines'],
     ['/settings/agents', 'agents'],
     ['/settings/agent-config', 'agents'],
+    ['/settings/memory', 'memory'],
     ['/settings/agent-roles', 'agent-roles'],
     ['/settings/prompt-shortcuts', 'prompt-shortcuts'],
     ['/settings/mcp', 'mcp'],

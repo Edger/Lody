@@ -1,8 +1,11 @@
+import { SimulatorIceServersSchema } from '@/ios-simulator/webrtc-protocol';
 import { ConvexClient, ConvexHttpClient } from 'convex/browser';
 import { z } from 'zod';
 import { api } from '@lody/cloud-api';
+import { ShareDeliveryEnvelopeSchema } from '@lody/shared/session-share-delivery';
 import {
   buildLoroStreamsTokenEndpoint,
+  PreviewControlVerificationSchema,
   createLoroStreamsTokenProvider,
   deriveConvexSiteUrl,
   normalizeBaseUrl,
@@ -13,7 +16,6 @@ import {
   type CloudBillingPort,
   type CloudPort,
   type CloudSessionSharingPort,
-  type CloudPrAssociationInput,
   type CloudStreamsTokenPort,
   type CloudUsageUpdateInput,
   type WorkspaceSummary,
@@ -30,6 +32,7 @@ import { NotificationService } from './notifications';
 import { UsageTrackingService, type RecordSessionUsageInput } from './usage/usage-tracking-service';
 import { GitHubTokenManager } from './github-token-manager';
 import { submitBugReportFromMachine } from './bug-report';
+import { createCloudPrAssociationPort } from './cloud-pr-association';
 
 type WorkspaceListResult =
   | { valid: false; userId: null; workspaces: WorkspaceSummary[] }
@@ -41,7 +44,6 @@ export interface CloudCliPortOptions {
   authBaseUrl: string;
   authSiteUrl?: string;
   serverBaseUrl: string;
-  previewGatewayUrl?: string;
   /** Optional operator mirror; the public artifact channel is the default. */
   runtimeArtifactsBaseUrl?: string;
   logger: Logger;
@@ -56,10 +58,19 @@ export function createCloudSessionSharingPort(options: {
     .object({
       requestId: z.string().min(1),
       shareRequestId: z.string().min(1),
-      status: z.enum(['pending', 'confirmed', 'cancelled', 'expired']),
+      status: z.enum(['pending', 'confirmed', 'cancelled', 'expired', 'published']),
+      shareId: z.string().optional(),
+      delivery: ShareDeliveryEnvelopeSchema.optional(),
     })
     .strict();
   return {
+    getResult: async (input) =>
+      result.parse(
+        await client.query(api.sessionSharing.getRequestResultFromCli, {
+          ...input,
+          cliToken: options.token,
+        })
+      ),
     request: async (input) =>
       result.parse(
         await client.mutation(api.sessionSharing.requestFromCli, {
@@ -237,27 +248,44 @@ export function createCloudCliPort(options: CloudCliPortOptions): CloudPort {
             }),
         }),
     },
-    prAssociation: {
-      associatePullRequest: async (input: CloudPrAssociationInput) => {
-        const { ownerSessionId, ...association } = input;
-        const response = await fetch(new URL('/api/action', authSiteUrl), {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            path: 'github:associatePullRequestForCli',
-            args: {
-              ...association,
-              sessionId: ownerSessionId,
-              cliToken: options.token,
-            },
-          }),
-        });
-        return response.ok;
-      },
-    },
+    prAssociation: createCloudPrAssociationPort({ token: options.token, authSiteUrl }),
     attachmentUpload: { serverBaseUrl },
     remotePreview: {
-      gatewayBaseUrl: normalizeBaseUrl(options.previewGatewayUrl?.trim() || serverBaseUrl),
+      simulatorIceServers: async (input) => {
+        const response = await getCliHttpFetch({ logger: options.logger })(
+          new URL('/api/ios-simulator/ice-servers', authSiteUrl),
+          {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              Authorization: `Bearer ${options.token}`,
+            },
+            body: JSON.stringify(input),
+            signal: AbortSignal.timeout(10_000),
+            redirect: 'error',
+          }
+        );
+        if (!response.ok) throw new Error('Simulator relay configuration is unavailable.');
+        return z
+          .object({ iceServers: SimulatorIceServersSchema, expiresAt: z.number().finite() })
+          .parse(await response.json());
+      },
+      verifyControl: async (input) => {
+        const response = await getCliHttpFetch({ logger: options.logger })(
+          new URL('/api/session-preview/verify', authSiteUrl),
+          {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              Authorization: `Bearer ${options.token}`,
+            },
+            body: JSON.stringify(input),
+            signal: AbortSignal.timeout(10_000),
+          }
+        );
+        if (!response.ok) throw new Error(`Preview authorization failed (${response.status}).`);
+        return PreviewControlVerificationSchema.parse(await response.json());
+      },
     },
     runtimeArtifacts: {
       baseUrl: resolveRuntimeArtifactsBaseUrl(options.runtimeArtifactsBaseUrl),

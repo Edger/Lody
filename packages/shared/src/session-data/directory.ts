@@ -29,7 +29,8 @@ export function pickDirectoryScalars(source: unknown): SessionDirectoryScalars |
   if (typeof source.userTurnId === 'string') scalars.userTurnId = source.userTurnId;
   if (typeof source.acpTurnId === 'string') scalars.acpTurnId = source.acpTurnId;
   if (typeof source.startedAt === 'number') scalars.startedAt = source.startedAt;
-  if (typeof source.permissionWaitMs === 'number') scalars.permissionWaitMs = source.permissionWaitMs;
+  if (typeof source.permissionWaitMs === 'number')
+    scalars.permissionWaitMs = source.permissionWaitMs;
   return scalars as SessionDirectoryScalars;
 }
 
@@ -44,9 +45,9 @@ export function pickDirectoryInputConfig(source: unknown): unknown {
     if (source[key] !== undefined) picked[key] = source[key];
   }
   const normalized = normalizeSessionTurnInputConfig({
+    memory: picked.memory,
     mcpServerIds: picked.mcpServerIds,
     configOptionValues: picked.configOptionValues,
-    taskToolsEnabled: picked.taskToolsEnabled,
     cliType: picked.cliType,
     agentType: picked.agentType,
   });

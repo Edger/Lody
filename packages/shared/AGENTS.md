@@ -1,9 +1,10 @@
 # Shared contracts
 
-`CLAUDE.md` is a symlink to this file. Edit `AGENTS.md` only.
+`CLAUDE.md` symlinks here. Edit `AGENTS.md` only.
 
-Archive uses `collectSessionArchiveTargets` for contained/opened descendants;
-restore/delete retain containment-only targets. See [relations](../../specs/session-relations.md).
+Discover archive/restore/delete from one ready Repo snapshot, never UI caches.
+Archive uses `collectSessionArchiveTargets`; restore/delete keep direct containment.
+Exact deletion bypasses discovery: [relations](../../specs/session-relations.md).
 
 ## Session history
 
@@ -40,8 +41,7 @@ restore/delete retain containment-only targets. See [relations](../../specs/sess
   not untouched stored payloads. Content-list edits retain unchanged blocks and parse
   authored blocks; tool identity changes still use the complete item parser.
 - Normalize legacy built-in CLI selectors on new history input only. Independent stored
-  input-config and task-proposal metadata edits validate changed fields, not untouched
-  historical values; proposal identity changes still require complete parsing.
+  input-config metadata edits validate changed fields, not untouched historical values.
 - ACP tool blocks and locations are explicit JSON extension boundaries. Unknown block
   types must not bypass validation of malformed known variants. Preserve declared `_meta`
   and extension keys; closed execution configuration still selects declared fields.
@@ -56,27 +56,29 @@ restore/delete retain containment-only targets. See [relations](../../specs/sess
   Resolve the live turn on each call, preserve immutable ids, and preflight before writing.
   Generic history updates remain for operations with cross-turn ownership or structural edits.
 - Permission responses inspect request metadata and materialize only the matching turn;
-  a supplied turn id restricts lookup to that turn. Renderer task-proposal decisions use
-  `updateEntry`, not a whole-history callback. Preserve legacy JSON metadata on lookup.
+  a supplied turn id restricts lookup to that turn. Preserve legacy JSON metadata on lookup.
 - Mirror's text-event optimization ships upstream in pinned `loro-mirror`; no local patch
   exists and no storage schema or write validation depends on it.
+- Subagent events must preserve run identity and root ownership.
 
 ## Machine protocol negotiation
+
+- Ask Question consumers must preserve Core note/replacement semantics and validate
+  associations per the [notes contract](../../specs/ask-question-answer-notes.md).
 
 - Independent Plan configuration uses Core's boolean `plan_mode`, including static
   capabilities, semantic dispatch, and UI toggles. Preserve `collaboration_mode`
   default/plan only for agents that advertise the legacy option; planning must not
   change permission policy.
 
-- Daemon-backed workflows negotiate versions through
-  `MachineMeta.protocolCapabilities`; never infer from the CLI release. Missing
-  capabilities mean unsupported. Set and version checks share one binding in
-  `packages/shared/src/machine-protocol-capabilities.ts` so a key never travels
-  without its version.
+- Daemon workflows gate on `MachineMeta.protocolCapabilities`, never CLI version.
+  Missing means unsupported; keep key/version pairs in `machine-protocol-capabilities.ts`.
 - ACP capability `cacheVersion` controls refresh freshness, never readability. Consumers
   preserve understood fields from parsed older or newer entries during mixed-version
   operation, adapting only fields with known incompatible semantics; runtime-override source
   matching remains a separate applicability gate.
+- Rate limits use `agentConfigId + limitId`; bound Providers ignore legacy
+  machine/type rows, and deletion removes scoped rows.
 
 ## Session goal control
 
@@ -90,7 +92,7 @@ restore/delete retain containment-only targets. See [relations](../../specs/sess
   provider name check. A goal turn carries no run configuration, so resuming cannot
   change model or mode. Behavior: [goal control Spec](../../specs/session-goal-control.md).
 
-## Workspace MCP and Agent Roles
+## Workspace MCP / Roles
 
 - Workspace MCP has exactly two durable layers: catalog entries in the workspace Flock
   document and selected ids in each user turn input config. Do not add machine bindings.
@@ -100,17 +102,19 @@ restore/delete retain containment-only targets. See [relations](../../specs/sess
   upload. Settings neither await nor report upload; upload failure must not fail or
   roll back a durable write. CLI reports its sync result. See
   [catalog explanation](../../.agents/docs/workspace-catalog-durability.md).
-- Roles use one workspace Flock `agentRole` family; sharing updates `visibility`.
-  Store no secrets, API keys, MCP selections, or memory; apply
-  `isSensitiveAgentRoleConfigOptionKey` on read and write. Roles pin permission via
-  `runConfig.modeId` or `_permission`; hide the separate composer permission button
-  when pinned, but keep warning-tone modes visibly marked on every such surface.
-  Role-level auto-approval policy is out of scope. Settings/mentions use
-  `canReadAgentRole`/`canManageAgentRole`; MCP resolves explicit Role ids from the
-  catalog without requiring mention-scoped authorization.
-- Roles bind exact `machineId + agentConfigId`, never fall back, and remain listed
-  with precise reasons but unmentionable when machine/config/model/mode is unavailable.
-  Before Operation acceptance, MCP resolves the current `agentRoleId` row and freezes
-  canonical Prompt, target, Role revision, and dispatch config into the Operation;
-  edits/deletion cannot change recovery or retry. `SessionMeta.agentRoleId` and
-  `agentRoleRevision` are display-only creation provenance.
+- Roles use one workspace Flock `agentRole` family; sharing changes `visibility`.
+  No secrets, API keys, MCP selections or memory contents. Apply
+  `isSensitiveAgentRoleConfigOptionKey` on read/write. Permission pins use
+  `runConfig.modeId` or `_permission`: hide the separate composer permission
+  button but retain warning-tone markings. No Role-level auto-approval policy.
+  Settings/mentions use `canReadAgentRole`/`canManageAgentRole`; explicit MCP
+  lookup needs no mention grant.
+- Roles bind exact `machineId + agentConfigId` without fallback. Unavailable
+  machine/config/model/mode stays listed with reasons but cannot be mentioned.
+  MCP freezes the current Role's Prompt, target, revision and dispatch config
+  before acceptance; edits/deletion cannot change retries/recovery.
+  Session Role metadata is creation provenance only.
+- Memory stores provider/id references, frozen per turn. Daemon commands and env
+  mapping follow the [memory contract](../../specs/agent-role-memory.md).
+- Keep `author`, human `userId`, and recipient execution config separate.
+  [Contract](../../specs/message-author-identity.md).

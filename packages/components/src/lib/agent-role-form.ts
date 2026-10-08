@@ -6,6 +6,7 @@ import {
   isAgentRoleContentEqual,
   isSensitiveAgentRoleConfigOptionKey,
   normalizeAgentRoleEmoji,
+  normalizeAgentRoleDescription,
   normalizeAgentRoleMentionSlug,
   normalizeAgentRoleRunConfig,
   type AgentConfigId,
@@ -28,12 +29,14 @@ import {
  */
 export type AgentRoleFormValue = {
   name: string;
+  description: string;
   emoji: string;
   machineId: MachineId | null;
   agentConfigId: AgentConfigId | null;
   modeId: string | null;
   modelId: string | null;
   configOptionValues: Record<string, string | boolean>;
+  memory?: AgentRoleRunConfig['memory'];
   promptPrefix: string;
   /** Off by default: a new Role is private until its owner says otherwise. */
   shareWithWorkspace: boolean;
@@ -41,6 +44,7 @@ export type AgentRoleFormValue = {
 
 export const EMPTY_AGENT_ROLE_FORM_VALUE: AgentRoleFormValue = {
   name: '',
+  description: '',
   emoji: '',
   machineId: null,
   agentConfigId: null,
@@ -84,12 +88,14 @@ export const buildAgentRoleFormValueFromRunConfig = (input: {
 
 export const buildAgentRoleFormValue = (role: AgentRole): AgentRoleFormValue => ({
   name: role.name,
+  description: role.description ?? '',
   emoji: role.emoji ?? '',
   machineId: role.machineId,
   agentConfigId: role.agentConfigId,
   modeId: role.runConfig.modeId ?? null,
   modelId: role.runConfig.modelId ?? null,
   configOptionValues: { ...(role.runConfig.configOptionValues ?? {}) },
+  memory: role.runConfig.memory,
   promptPrefix: role.promptPrefix ?? '',
   shareWithWorkspace: role.visibility === 'workspace',
 });
@@ -140,6 +146,7 @@ export const validateAgentRoleForm = (
  */
 export const buildAgentRoleRunConfig = (value: AgentRoleFormValue): AgentRoleRunConfig =>
   normalizeAgentRoleRunConfig({
+    memory: value.memory,
     modeId: value.modeId ?? undefined,
     modelId: value.modelId ?? undefined,
     configOptionValues: value.configOptionValues,
@@ -169,6 +176,7 @@ export const buildAgentRoleFromForm = (
     ownerUserId: existing?.ownerUserId ?? ownerUserId,
     visibility: value.shareWithWorkspace ? 'workspace' : 'private',
     name: value.name.trim(),
+    description: normalizeAgentRoleDescription(value.description),
     ...(emoji ? { emoji } : {}),
     machineId: value.machineId as MachineId,
     agentConfigId: value.agentConfigId as AgentConfigId,
