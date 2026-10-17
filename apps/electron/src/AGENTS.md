@@ -17,6 +17,9 @@ native-dependency, and OSS-composition rules stay in `apps/electron/AGENTS.md`.
 - Put domain services in `src/main/services/*`, IPC handlers and input validation in
   `src/main/ipc/*`, and local-project worker/storage code in
   `src/main/local-project/*`.
+- Main starts, awaits and signals processes only through `@lody/shared/node/process`
+  (never `child_process` or `kill`); `check:cli-process-boundary` enforces it.
+  Rules: [process layer](../../../packages/shared/src/node/AGENTS.md).
 - Main-process-only helpers belong in `src/main/utils.ts`. Put cross-runtime types and
   pure logic in `@lody/shared`; shared Electron IPC contracts live in the narrow
   `@lody/shared/electron-ipc` export.
@@ -90,9 +93,10 @@ native-dependency, and OSS-composition rules stay in `apps/electron/AGENTS.md`.
 
 ## Local file resources
 
-- CLI `file/resolve-local` owns session/path resolution; Electron owns file IO. Never
-  put local file bytes back into the daemon's JSON response or expose filesystem
-  paths in resource URLs. `local-file-resource.ts` issues opaque renderer-lifetime
+- Electron previews local files directly after matching the target to its on-disk
+  machine identity; never require daemon liveness or protocol metadata. Relative
+  paths need the original workspace root; never guess a substitute. Remote paths
+  stay remote. Never expose filesystem paths in resource URLs. `local-file-resource.ts` issues opaque renderer-lifetime
   capabilities, bounded per renderer, revoked on navigation/destruction.
 - Each resource read opens a regular file without following a substituted symlink
   and checks device/inode/size/mtime/ctime before and during reads. Replacement or

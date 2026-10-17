@@ -1,4 +1,7 @@
+import type { Effect, Scope } from 'effect';
+export type { LoroStreamsTokenProvider } from '@lody/shared';
 import type {
+  BugReportClientLog,
   LiveActivityConversationItem,
   LiveActivityPermissionAlert,
   LiveActivityStatusCounts,
@@ -9,7 +12,8 @@ import type {
   MachineId,
   SessionId,
   WorkspaceId,
-  createLoroStreamsTokenProvider,
+  createLoroStreamsTokenProviderLegacy,
+  LoroStreamsTokenProvider,
 } from '@lody/shared';
 import type { PlatformKind, WorkspaceSummary } from './provider';
 import type {
@@ -134,10 +138,16 @@ export interface CloudAccessPort {
   }): Promise<CloudWorkspaceUserProfile | null>;
 }
 
-export type LoroStreamsTokenProvider = ReturnType<typeof createLoroStreamsTokenProvider>;
+export type LoroStreamsTokenProviderLegacy = ReturnType<
+  typeof createLoroStreamsTokenProviderLegacy
+>;
 
 export interface CloudStreamsTokenPort {
-  createTokenProvider(options: { workspaceId: WorkspaceId }): LoroStreamsTokenProvider;
+  createTokenProvider(options: {
+    workspaceId: WorkspaceId;
+  }): Effect.Effect<LoroStreamsTokenProvider, never, Scope.Scope>;
+  /** @deprecated Promise consumers retain the visible Legacy entry until their owners migrate. */
+  createTokenProviderLegacy(options: { workspaceId: WorkspaceId }): LoroStreamsTokenProviderLegacy;
 }
 
 export interface CloudPermissionRequestNotificationInput {
@@ -223,6 +233,8 @@ export interface CloudBugReportInput {
   reporterUserId: string;
   requestToken: string;
   machineUserId: string;
+  /** The reporter's client log, already validated against its schema. */
+  clientLog?: BugReportClientLog;
 }
 
 export interface CloudBugReportPort {

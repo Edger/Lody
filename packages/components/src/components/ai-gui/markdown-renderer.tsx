@@ -11,6 +11,7 @@ import {
   type ComponentType,
   type CSSProperties,
   type ReactNode,
+  Children,
   createContext,
   lazy,
   useState,
@@ -37,6 +38,7 @@ import rehypeKatex from 'rehype-katex';
 import rehypeRaw from 'rehype-raw';
 import rehypeSanitize from 'rehype-sanitize';
 import remarkGfm from 'remark-gfm';
+import remarkCjkFriendly from 'remark-cjk-friendly/parseOnly';
 import remarkMath from 'remark-math';
 import { Check, Copy, MessagesSquare } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
@@ -55,6 +57,7 @@ import {
 import { cn } from '@/lib/utils';
 import { usePrLinkInterceptor } from './pr-link-context';
 import { parseSessionLinkHref, useSessionLinkNavigator } from './session-link-context';
+import { parseSessionLink, type SessionLink } from '@lody/shared/session-link';
 import {
   SEARCH_HIGHLIGHT_ACTIVE_MARK_CLASS_NAME,
   SEARCH_HIGHLIGHT_MARK_CLASS_NAME,
@@ -81,6 +84,7 @@ import type { MarkdownAgentFileLinkMenuItem } from '@/hooks/use-session-file-act
 import { ContextMenu } from '@/ui/armed-overlays';
 import { MarkdownFileImage, MarkdownFileResourcesContext } from './markdown-file-image';
 import { resolveMarkdownImagePath } from '@/lib/session-file-open-target';
+import { getImageMimeTypeForPath } from '@/lib/image-file-preview';
 import { rehypeHeadingAnchors } from './markdown-heading-anchors';
 
 export { createMarkdownMermaidConfig } from './markdown-mermaid';
@@ -412,21 +416,21 @@ const SESSION_LINK_CHIP_CLASS_NAME =
   'markdown-reference-chip mx-[0.1em] inline-flex max-w-full items-center gap-[0.35em] rounded-md px-[0.4em] align-[-0.12em] text-[0.92em] leading-[1.55] transition-colors';
 
 /**
- * A `[Title](session://<id>)` link as a conversation chip. It is a button, not
- * an anchor: `session://` is not a navigable URL, so the only way there is the
- * in-app Session navigation. Without one (share pages, read-only surfaces) the
+ * A session resource link as a conversation chip, using in-app navigation
+ * instead of sending the URI to the OS. Without navigation (read-only surfaces) the
  * chip still names the conversation but does nothing.
  */
 function MarkdownSessionLink({
-  sessionId,
+  target,
   children,
   inert,
 }: {
-  sessionId: SessionId;
+  target: SessionLink;
   children: ReactNode;
   inert: boolean;
 }) {
   const navigate = useSessionLinkNavigator();
+  const sessionId = target.sessionId;
   // Composer mentions label the link `@Title`; the glyph already says "session".
   const title = markdownLinkText(children).trim().replace(/^@/u, '') || sessionId;
   const body = (
@@ -448,7 +452,13 @@ function MarkdownSessionLink({
       data-session-link={sessionId}
       title={title}
       className={cn(SESSION_LINK_CHIP_CLASS_NAME, 'cursor-pointer')}
-      onClick={() => navigate({ sessionId })}
+      onClick={() =>
+        navigate({
+          ...target,
+          sessionId: sessionId as SessionId,
+          tabSessionId: target.tabSessionId as SessionId | undefined,
+        })
+      }
     >
       {body}
     </button>
@@ -862,6 +872,7 @@ const remarkMarkUnclosedFences = () => (tree: unknown, file: MarkdownFile) => {
 
 const MARKDOWN_REMARK_PLUGINS = [
   remarkGfm,
+  remarkCjkFriendly,
   remarkRepairMalformedGfmAutolinks,
   remarkLinkifyPlainUrls,
   remarkLinkifyFilePaths,
@@ -1078,6 +1089,37 @@ const AgentFileLink = ({
   );
 };
 
+/**
+ * In a live file preview, a plain-text link to an image file shows the image
+ * itself (same loading rules as `![]()`) instead of the copy-path chip. Links
+ * with their own markup (e.g. a badge image) or a line anchor keep the chip.
+ */
+function MarkdownFileImageLink({
+  href,
+  label,
+  fallback,
+}: {
+  href: string;
+  label: ReactNode;
+  fallback: ReactNode;
+}) {
+  const resources = useContext(MarkdownFileResourcesContext);
+  const content = Children.toArray(label);
+  const target = parseMarkdownAgentFileHref(href);
+  if (
+    !resources ||
+    !target ||
+    target.startLine != null ||
+    !getImageMimeTypeForPath(target.filePath) ||
+    resolveMarkdownImagePath(resources.documentPath, href) === null ||
+    !content.every((child) => typeof child === 'string' || typeof child === 'number')
+  ) {
+    return fallback;
+  }
+  const text = content.join('').trim();
+  return <MarkdownFileImage src={href} alt={text && text !== href ? text : undefined} />;
+}
+
 function isWorkspaceResourceHref(href: string): boolean {
   try {
     return (
@@ -1236,10 +1278,10 @@ const createMarkdownComponents = ({
         </a>
       );
     }
-    const linkedSessionId = parseSessionLinkHref(href);
-    if (linkedSessionId) {
+    const linkedSession = parseSessionLink(href);
+    if (linkedSession) {
       return (
-        <MarkdownSessionLink sessionId={linkedSessionId} inert={readonly}>
+        <MarkdownSessionLink target={linkedSession} inert={readonly}>
           {children}
         </MarkdownSessionLink>
       );
@@ -1252,15 +1294,21 @@ const createMarkdownComponents = ({
 
     if (isMarkdownAgentFileHref(href)) {
       return (
-        <AgentFileLink
+        <MarkdownFileImageLink
           href={href}
-          onFilePathClick={onAgentFileLinkClick}
-          copyAgentFileLabel={copyAgentFileLabel}
-          openAgentFileLabel={openAgentFileLabel}
-          getContextMenuItems={getAgentFileLinkContextMenuItems}
-        >
-          {children}
-        </AgentFileLink>
+          label={children}
+          fallback={
+            <AgentFileLink
+              href={href}
+              onFilePathClick={onAgentFileLinkClick}
+              copyAgentFileLabel={copyAgentFileLabel}
+              openAgentFileLabel={openAgentFileLabel}
+              getContextMenuItems={getAgentFileLinkContextMenuItems}
+            >
+              {children}
+            </AgentFileLink>
+          }
+        />
       );
     }
 
@@ -1275,7 +1323,7 @@ const createMarkdownComponents = ({
           {...rest}
           className={cn(
             rest.className,
-            'markdown-reference-chip mx-[0.1em] inline-flex max-w-full items-center rounded-md px-[0.4em] align-[-0.12em] text-[0.92em] leading-[1.55] transition-colors'
+            'markdown-reference-chip mx-[0.1em] inline-flex max-w-full items-baseline rounded-md px-[0.4em] align-baseline text-[1em] leading-[1.55] transition-colors'
           )}
         >
           <GitHubReferenceChip reference={githubReference} />
@@ -1451,6 +1499,9 @@ export const MarkdownRenderer = memo(function MarkdownRenderer({
   const readonly = useContext(SessionReadonlyContext);
   const getAgentFileLinkContextMenuItems = useContext(AgentFileLinkContextMenuItemsContext);
   const containerRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    void import('./markdown-math-copy');
+  }, []);
   /** Text nodes split for search marks in this block, with what to undo. */
   const searchSplitsRef = useRef<SearchTextSplit[]>([]);
   const search = useSelectionStableValue(useSessionSearch());

@@ -1,4 +1,8 @@
-import type { LodyClientExtensionCapabilities, LodyWorktreeProject } from 'acp-extension-core';
+import type {
+  LodyClientExtensionCapabilities,
+  LodyWorktreeProject,
+  LodySessionConfig,
+} from 'acp-extension-core';
 import { randomUUID } from 'crypto';
 import { promises as fs } from 'fs';
 import path from 'path';
@@ -341,11 +345,6 @@ export type AcpStartupTimeoutOptions = {
   resumeSessionTimeoutMs?: number;
 };
 
-export type AcpSessionStartTarget = {
-  workdir: string;
-  resumeSessionId?: ACPSessionId;
-};
-
 const LegacyCodexGoalStatusSchema = z.enum([
   'active',
   'paused',
@@ -577,6 +576,7 @@ export interface AgentClientOptions {
     agentType: string;
   };
   /** Config selected before ACP session establishment. */
+  modelId?: SessionTurnInputConfig['modelId'];
   configOptionValues?: SessionTurnInputConfig['configOptionValues'];
   /** Launcher family (npx/uvx/local) for ACP startup analytics; non-PII. */
   launcher?: AcpLauncher;
@@ -1360,6 +1360,10 @@ export class AgentClient implements acp.Client {
     return {};
   }
 
+  getRateLimitsCapability() {
+    return this.lodyExtensionCapabilities.rateLimits;
+  }
+
   async getRateLimits(request: RateLimitsGetRequest = {}): Promise<RateLimitsSnapshot> {
     if (this.lodyExtensionCapabilities.rateLimits?.query !== true) {
       throw new Error('[ACP_RATE_LIMITS_UNSUPPORTED] Agent did not advertise rate-limit queries');
@@ -1813,17 +1817,19 @@ export class AgentClient implements acp.Client {
 
   private getSessionStartMeta(forkSessionTurnId?: string) {
     const clientIdentifier = this.getGrokClientIdentifier();
+    const modelId = this.currentModel?.modelId ?? this.options.modelId;
     const lody = {
       ...(this.worktreeProject ? { worktreeProject: this.worktreeProject } : {}),
       ...(forkSessionTurnId !== undefined
         ? { forkAtTurn: { version: 1 as const, turnId: forkSessionTurnId } }
         : {}),
-      ...(Object.keys(this.configOptionValues).length > 0
+      ...(modelId || Object.keys(this.configOptionValues).length > 0
         ? {
             sessionConfig: {
               version: 1 as const,
+              ...(modelId ? { modelId } : {}),
               configOptionValues: { ...this.configOptionValues },
-            },
+            } satisfies LodySessionConfig,
           }
         : {}),
     };
@@ -1909,7 +1915,6 @@ export class AgentClient implements acp.Client {
     resumeSessionId?: ACPSessionId,
     timeoutOptions: AcpStartupTimeoutOptions = {},
     startupAbort?: Promise<never>,
-    resolveSessionStart?: () => Promise<AcpSessionStartTarget>,
     forkSessionId?: ACPSessionId,
     forkSessionTurnId?: string
   ): Promise<acp.NewSessionResponse> {
@@ -2072,12 +2077,6 @@ export class AgentClient implements acp.Client {
         this.acknowledgedSteerCapability ? 'yes' : 'no'
       } fork=${this.supportsFork ? 'yes' : 'no'} forkMethod=${hasForkMethod ? 'yes' : 'no'})`
     );
-
-    if (resolveSessionStart) {
-      const target = await withAbort(resolveSessionStart(), startupAbort);
-      workdir = target.workdir;
-      resumeSessionId = target.resumeSessionId;
-    }
 
     if (
       this.lodyExtensionCapabilities.worktreeProject?.version === 1 &&

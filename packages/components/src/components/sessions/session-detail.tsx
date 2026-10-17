@@ -1,4 +1,6 @@
+import { getIpcServices } from '@/lib/electron-ipc-client';
 import { buildDraftUserHistoryEntry } from '@/lib/session-attachment-draft';
+import { pendingSessionLinkAtom } from '@/lib/session-deep-link';
 import { windowPreparationAtom } from '@/lib/window-preparation';
 import { useEmptySessionDraft } from '@/hooks/use-empty-session-draft';
 import { sessionHasUnreadMessages } from '@/lib/session-read-receipt';
@@ -177,10 +179,11 @@ import {
   MobileProjectFileBrowser,
   type MobileProjectFileBrowserHandle,
 } from '@/components/files/mobile-project-file-browser';
-import { getAppShareUrl } from '@/lib/app-location';
+import { buildSessionLink } from '@lody/shared/session-link';
 import { getCommandKeybindings, useCommand } from '@/lib/commands';
 import { useDesktopTabCloser } from '@/lib/desktop-tab-or-window-close';
 import { useSemanticActionRouter } from '@/lib/commands/use-semantic-action-router';
+import type { SemanticActionRouter } from '@/lib/commands/semantic-action-router';
 import { semanticShortcutsFeatureEnabledAtom } from '@/atoms/settings';
 import { cn, getBasename } from '@/lib';
 
@@ -1015,6 +1018,7 @@ const SessionDetail = ({
   const sendingDraftIdsRef = useRef<Set<DraftSessionTab['id']>>(new Set());
   const desktopTabFocusRegionRef = useRef<SessionTabFocusRegion>('conversation');
   const desktopActionRootRef = useRef<HTMLDivElement>(null);
+  const semanticRouterRef = useRef<SemanticActionRouter | null>(null);
   const semanticShortcutsEnabled = useAtomValue(semanticShortcutsFeatureEnabledAtom);
   const initialTabState = getSessionDetailInitialTabState(sessionId, urlTab, {
     oneActiveSurface: isMobile,
@@ -1112,6 +1116,8 @@ const SessionDetail = ({
   const atomWorkspaceSlug = useAtomValue(currentWorkspaceSlugAtom);
   const workspaceSlug = routeTargetWorkspaceSlug ?? atomWorkspaceSlug;
   const currentWorkspaceId = useAtomValue(currentWorkspaceIdAtom) as WorkspaceId | null;
+  const pendingSessionLink = useAtomValue(pendingSessionLinkAtom);
+  const clearPendingSessionLink = useSetAtom(pendingSessionLinkAtom);
   const isLeftSidebarHidden = !useAtomValue(navigationSidebarVisibleAtom);
   const showNavigationSidebar = useSetAtom(showNavigationSidebarAtom);
   const runtime = useAtomValue(activeWorkspaceRuntimeAtom);
@@ -2064,12 +2070,21 @@ const SessionDetail = ({
   // A draft choice in an archived workspace is replaced the same way.
   useEffect(() => {
     if (!docMetaCacheReady) return;
+    if (pendingTabRestoreNavigation?.tabSessionId === requestedTabSessionId) return;
+    if (
+      pendingSessionLink?.workspaceId === currentWorkspaceId &&
+      (pendingSessionLink.tabSessionId ?? pendingSessionLink.sessionId) === requestedTabSessionId
+    )
+      return;
     if (!isArchivedDraftChoice && !closedConversationIds.has(requestedTabSessionId)) return;
     if (router.state.location.search.tab !== urlTab) return;
     navigateToSessionTab(activeTabSessionId);
   }, [
     docMetaCacheReady,
     isArchivedDraftChoice,
+    pendingSessionLink,
+    pendingTabRestoreNavigation,
+    currentWorkspaceId,
     closedConversationIds,
     requestedTabSessionId,
     activeTabSessionId,
@@ -3005,7 +3020,10 @@ const SessionDetail = ({
   const handleCopyUrl = useCallback(
     async (successMessage?: string, failureMessage?: string) => {
       try {
-        await navigator.clipboard.writeText(getAppShareUrl());
+        if (!currentWorkspaceId || !activeSessionTabId) throw new Error('Session is not ready');
+        await navigator.clipboard.writeText(
+          buildSessionLink({ sessionId: activeSessionTabId, workspaceId: currentWorkspaceId })
+        );
         captureSessionDetailEvent('session/share_link_copied');
         toast.success(successMessage ?? t('sessions.urlCopied', 'Session URL copied to clipboard'));
       } catch {
@@ -3013,7 +3031,7 @@ const SessionDetail = ({
         toast.error(failureMessage ?? t('sessions.copyFailed', 'Unable to copy'));
       }
     },
-    [captureSessionDetailEvent, t]
+    [captureSessionDetailEvent, t, currentWorkspaceId, activeSessionTabId]
   );
 
   const handleRequestShareSession = useCallback(
@@ -3180,13 +3198,9 @@ const SessionDetail = ({
     }
     const activeChatRef = chatRefsMap.current.get(activeTabSessionId);
     if (activeChatRef && 'openSearch' in activeChatRef) {
-      captureSessionDetailEvent('session/search_open_requested', {
-        tab_session_id: activeTabSessionId,
-        source: 'session_detail_menu',
-      });
       activeChatRef.openSearch();
     }
-  }, [activeDraftTab, activeTabSessionId, captureSessionDetailEvent]);
+  }, [activeDraftTab, activeTabSessionId]);
 
   // Single fork entry point for every launcher: the header/footer action forks
   // into a top tab, the side-panel launcher forks into a right-hand panel.
@@ -3399,7 +3413,10 @@ const SessionDetail = ({
   );
 
   const upsertViewerTab = useCallback(
-    (tab: ViewerTab) => {
+    (
+      tab: ViewerTab,
+      claimCloseTarget = () => semanticRouterRef.current?.activate('side-panel')
+    ) => {
       setViewerTabs((prev) => {
         const idx = prev.findIndex((item) => item.id === tab.id);
         if (idx === -1) {
@@ -3425,6 +3442,7 @@ const SessionDetail = ({
       } else {
         selectSidePanelTab(tab.id);
         revealRightSidebar();
+        claimCloseTarget();
       }
     },
     [isMobile, revealRightSidebar, selectSidePanelTab]
@@ -3682,6 +3700,7 @@ const SessionDetail = ({
     } else {
       revealRightSidebar();
       activateSidebarTab('changes');
+      semanticRouterRef.current?.activate('side-panel');
       captureSessionDetailEvent('session/sidebar_tab_selected', {
         source: 'info_bar_diff_stat',
         sidebar_tab: 'changes',
@@ -3716,6 +3735,7 @@ const SessionDetail = ({
         }
         revealRightSidebar();
         activateSidebarTab('pr');
+        semanticRouterRef.current?.activate('side-panel');
       }
       captureSessionDetailEvent('session/pr_tab_opened', {
         pr_number: args.prNumber,
@@ -3794,6 +3814,7 @@ const SessionDetail = ({
       } else {
         revealRightSidebar();
         activateSidebarTab('browser');
+        semanticRouterRef.current?.activate('side-panel');
       }
       captureSessionDetailEvent('session/browser_tab_opened', {
         tab_session_id: tabSessionId ?? activeTabSessionId,
@@ -3825,6 +3846,7 @@ const SessionDetail = ({
     } else {
       revealRightSidebar();
       activateSidebarTab('ios-simulator');
+      semanticRouterRef.current?.activate('side-panel');
     }
   }, [activateSidebarTab, isMobile, replaceSessionUrlSimulator, revealRightSidebar]);
 
@@ -3846,15 +3868,24 @@ const SessionDetail = ({
 
   const handleOpenFile = useStableCallback(
     (filePath: string, options: SessionDetailOpenFileOptions = {}) => {
+      const claimCloseTarget = semanticRouterRef.current?.deferActivation('side-panel');
       setFileProviderRequestedByInteraction(true);
       void (async () => {
         // Where the path came from decides whether it may be rewritten at all;
         // `resolveSessionFileOpenTarget` owns that rule and documents why.
+        const preserveWorktreePath =
+          isElectronRenderer() &&
+          (isActiveSessionLocalMachine ||
+            (activeSessionMachineId
+              ? await getIpcServices()
+                  ?.machineRpc.isLocalFileMachine(activeSessionMachineId)
+                  .catch(() => false)
+              : false));
         const target = resolveSessionFileOpenTarget({
           rawPath: filePath,
           pathKind: options.pathKind ?? 'markdown-href',
           workspacePath: activeSessionWorkspacePath,
-          preserveWorktreePath: isElectronRenderer() && isActiveSessionLocalMachine,
+          preserveWorktreePath,
           ...(options.startLine === undefined ? {} : { startLine: options.startLine }),
           ...(options.endLine === undefined ? {} : { endLine: options.endLine }),
         });
@@ -3868,17 +3899,20 @@ const SessionDetail = ({
         const resolvedFilePath = resolution.path;
 
         const requestSeq = nextFocusRequestSeq();
-        upsertViewerTab({
-          id: getFileViewerTabId(resolvedFilePath, resolution.fileId),
-          type: 'file',
-          filePath: resolvedFilePath,
-          ...(resolution.fileId === undefined ? {} : { fileId: resolution.fileId }),
-          label: getBasename(resolvedFilePath),
-          startLine: target.startLine,
-          endLine: target.endLine,
-          focusRequestSeq: requestSeq,
-          ...(options.previewHtml ? { htmlPreviewRequestSeq: requestSeq } : {}),
-        });
+        upsertViewerTab(
+          {
+            id: getFileViewerTabId(resolvedFilePath, resolution.fileId),
+            type: 'file',
+            filePath: resolvedFilePath,
+            ...(resolution.fileId === undefined ? {} : { fileId: resolution.fileId }),
+            label: getBasename(resolvedFilePath),
+            startLine: target.startLine,
+            endLine: target.endLine,
+            focusRequestSeq: requestSeq,
+            ...(options.previewHtml ? { htmlPreviewRequestSeq: requestSeq } : {}),
+          },
+          () => claimCloseTarget?.()
+        );
         captureSessionDetailEvent('session/viewer_file_opened', {
           source: target.fromMarkdownLink ? 'markdown_link' : (options.source ?? 'file_tree'),
           file_extension: getFileExtension(resolvedFilePath),
@@ -4034,6 +4068,7 @@ const SessionDetail = ({
   const handleSessionTabSelect = useCallback(
     (tabId: string) => {
       desktopTabFocusRegionRef.current = 'conversation';
+      semanticRouterRef.current?.activate('conversation');
       // A user-driven switch PUSHES so tabs participate in history back.
       navigateToSessionTab(tabId, { push: true });
       if (isMobile) {
@@ -4128,6 +4163,58 @@ const SessionDetail = ({
     ]
   );
 
+  useEffect(() => {
+    if (
+      !pendingSessionLink ||
+      !docMetaCacheReady ||
+      pendingSessionLink.workspaceId !== currentWorkspaceId
+    )
+      return;
+    // A direct child URL first resolves its parent; let that existing redirect finish.
+    if (!activeSession || activeSession.parentSessionId) return;
+    const exactId = pendingSessionLink.tabSessionId ?? pendingSessionLink.sessionId;
+    const sideTarget = sideSessions.find((item) => item.id === exactId);
+    const isRootTarget = pendingSessionLink.sessionId === sessionId;
+    const isChildTarget =
+      !pendingSessionLink.tabSessionId &&
+      (allOrderedSessionTabIdSet.has(pendingSessionLink.sessionId) || sideTarget !== undefined);
+    if (!isRootTarget && !isChildTarget) return;
+    if (sideTarget) {
+      clearPendingSessionLink(null);
+      selectSidePanelTab(getSideSessionPanelTabId(sideTarget.id));
+      revealRightSidebar();
+      return;
+    }
+    const archivedTarget = closedConversations.find((item) => item.id === exactId);
+    if (archivedTarget && isArchivedOutsideWorkspace(archivedTarget, isWorkspaceArchived)) {
+      clearPendingSessionLink(null);
+      toast.error(t('deepLink.archived', 'Restore this archived conversation before opening it.'));
+      return;
+    }
+    if (!allOrderedSessionTabIdSet.has(exactId) && exactId !== sessionId) {
+      // A ready catalog is a snapshot, not proof that this child has synced yet.
+      // Keep waiting; the root request owner reports and clears a bounded timeout.
+      return;
+    }
+    clearPendingSessionLink(null);
+    handleNavigateSession({ sessionId, tabSessionId: exactId as SessionId });
+  }, [
+    pendingSessionLink,
+    docMetaCacheReady,
+    currentWorkspaceId,
+    activeSession,
+    sessionId,
+    allOrderedSessionTabIdSet,
+    clearPendingSessionLink,
+    handleNavigateSession,
+    sideSessions,
+    selectSidePanelTab,
+    revealRightSidebar,
+    closedConversations,
+    isWorkspaceArchived,
+    t,
+  ]);
+
   // When a viewer tab is selected, activate the viewer surface for the current session.
   const handleViewerTabSelect = useCallback(
     (tabId: string) => {
@@ -4136,6 +4223,7 @@ const SessionDetail = ({
       } else {
         selectSidePanelTab(tabId);
         revealRightSidebar();
+        semanticRouterRef.current?.activate('side-panel');
       }
       captureSessionDetailEvent('session/viewer_tab_selected', {
         viewer_tab_id: tabId,
@@ -4151,6 +4239,7 @@ const SessionDetail = ({
         desktopTabFocusRegionRef.current = 'side-panel';
       }
       activateSidebarTab(tabId);
+      semanticRouterRef.current?.activate('side-panel');
       if (tabId === 'pr' && latestPrNumber != null) {
         replaceSessionUrlPr(latestPrNumber, { push: true });
       }
@@ -4937,6 +5026,7 @@ const SessionDetail = ({
   const handleSidePanelTabSelect = useCallback(
     (tabId: string) => {
       desktopTabFocusRegionRef.current = 'side-panel';
+      semanticRouterRef.current?.activate('side-panel');
       if (isViewerTabId(tabId)) {
         handleViewerTabSelect(tabId);
         return;
@@ -4992,7 +5082,8 @@ const SessionDetail = ({
 
   const semanticCloseEnabled =
     semanticShortcutsEnabled && isElectronRenderer() && !isMobile && Boolean(activeSession);
-  const semanticRouterRef = useSemanticActionRouter({
+  useSemanticActionRouter({
+    routerRef: semanticRouterRef,
     rootRef: desktopActionRootRef,
     enabled: semanticCloseEnabled,
     resetKey: sessionId,
@@ -5594,6 +5685,7 @@ const SessionDetail = ({
         htmlPreviewRequestSeq={tab.htmlPreviewRequestSeq}
         saveRequestSeq={viewerTabSaveStates[tab.id]?.saveRequestSeq ?? 0}
         copyMarkdownRequestSeq={viewerTabSaveStates[tab.id]?.copyMarkdownRequestSeq ?? 0}
+        defaultHtmlPreview={isMobile}
         preferNativeMarkdownSelection={isMobile}
         fileProvider={activeSessionFileProvider}
         fileProviderPending={activeSessionFileProviderPending}

@@ -1,3 +1,4 @@
+import type { WorkspaceRepoLegacy } from '@lody/shared/workspace-data/repo-legacy';
 import {
   applyProviderSetupCancellationToFlock,
   encodeCodexProfileConfig,
@@ -22,7 +23,6 @@ import {
   type ProviderSetupTask,
   type WorkspaceId,
 } from '@lody/shared';
-import type { LoroRepo } from 'loro-repo';
 
 import type { SessionExecutionService } from '@/session/session-execution-service';
 import { formatErrorMessage } from '@/utils/format-error';
@@ -39,7 +39,7 @@ type ProviderSetupSyncScheduler = {
 };
 
 export type ProviderSetupManagerOptions = {
-  repo: LoroRepo;
+  repo: WorkspaceRepoLegacy;
   workspaceId: WorkspaceId;
   machineId: MachineId;
   execution: ProviderSetupExecution;
@@ -65,6 +65,19 @@ const isMissingBubRuntimeError = (error: string | undefined): boolean => {
   );
 };
 
+const isMissingDimcodeRuntimeError = (error: string | undefined): boolean => {
+  const normalized = error?.toLowerCase() ?? '';
+  return (
+    normalized.includes('spawn dimcode enoent') ||
+    normalized.includes('command not found') ||
+    normalized.includes('dimcode is not recognized') ||
+    normalized.includes("'dimcode' is not recognized") ||
+    normalized.includes("no such command 'acp'") ||
+    normalized.includes("unknown command 'acp'") ||
+    normalized.includes("unrecognized subcommand 'acp'")
+  );
+};
+
 /**
  * Owns the non-interactive half of built-in provider creation on the target
  * machine. Flock rows are the durable queue: syncing a row or restarting the
@@ -72,7 +85,7 @@ const isMissingBubRuntimeError = (error: string | undefined): boolean => {
  * explicitly resumes them.
  */
 export class ProviderSetupManager {
-  private readonly repo: LoroRepo;
+  private readonly repo: WorkspaceRepoLegacy;
   private readonly workspaceId: WorkspaceId;
   private readonly machineId: MachineId;
   private readonly execution: ProviderSetupExecution;
@@ -178,7 +191,7 @@ export class ProviderSetupManager {
       }
 
       // Non-managed builtins prepare their command during the live probe:
-      // Bub is user-installed and Dimcode uses npx. Keep the config
+      // Bub and Dimcode are user-installed. Keep the config
       // unpublished until that ACP process passes verification.
       if (isManagedBuiltinAgentType(setup.config.agentType)) {
         const preparing = await this.updateStatus(setup.id, attempt, 'preparing-runtime');
@@ -238,7 +251,8 @@ export class ProviderSetupManager {
       await this.fail(
         verifying.id,
         attempt,
-        verifying.config.agentType === 'bub' && isMissingBubRuntimeError(response.error)
+        (verifying.config.agentType === 'bub' && isMissingBubRuntimeError(response.error)) ||
+          (verifying.config.agentType === 'dimcode' && isMissingDimcodeRuntimeError(response.error))
           ? 'runtime-unavailable'
           : 'verification-failed'
       );

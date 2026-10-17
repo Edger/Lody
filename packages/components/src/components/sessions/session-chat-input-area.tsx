@@ -1,3 +1,7 @@
+import type { AgentConfigMeta } from '@lody/shared';
+import { canShowSubscriptionRateLimits } from '@/lib/session-usage';
+import { useProviderQuotaRefresh } from '@/hooks/use-provider-quota-refresh';
+import { useResolvedMachineMeta } from '@/hooks/use-resolved-machine-meta';
 import { snapshotAgentRole } from '@lody/shared';
 import { useSessionMentionSource } from '@/hooks/use-session-mention-source';
 import * as stylex from '@stylexjs/stylex';
@@ -130,6 +134,7 @@ import {
 } from '@/lib/mobile-keyboard-action';
 import { selectPastedClipboardFiles, splitImageAndFileAttachments } from '@/lib/file-drop';
 import { isPlainLinkPasteShortcut, parseAppSessionUrl } from '@/lib/session-app-url';
+import { readPastedSessionLink } from '@/lib/session-deep-link';
 import { SessionUsagePopover } from './session-usage-popover';
 import type { MachineRateLimits } from '@/lib/session-usage';
 
@@ -460,6 +465,7 @@ export interface SessionChatInputAreaProps {
   modelOptions: AcpSessionSelectOption[];
   /** Subscription limits already resolved from this session's machine Flock data. */
   rateLimits?: MachineRateLimits;
+  quotaConfig?: AgentConfigMeta;
   /**
    * Whether to offer the third-party Codex reset forecast, resolved by the
    * container from `canShowCodexResetForecast` with the session's full
@@ -584,6 +590,7 @@ export const SessionChatInputArea = memo(
       modeOptions,
       modelOptions,
       rateLimits,
+      quotaConfig,
       showCodexResetForecast = false,
       isContextCompacting = false,
       configOptionSelectors,
@@ -845,6 +852,21 @@ export const SessionChatInputArea = memo(
      * `expandPromptMentionsRef` beside it.
      */
     const mentionRangesRef = useRef<MentionRange[]>([]);
+    const { machine: quotaMachine } = useResolvedMachineMeta(session.machineId);
+    const refreshQuota = useProviderQuotaRefresh(
+      session.machineId,
+      session.agentConfigId,
+      isVisible &&
+        !!quotaConfig &&
+        !!session.agentConfigId &&
+        quotaMachine?.acpCapabilities?.[session.agentConfigId]?.rateLimits?.query === true &&
+        canShowSubscriptionRateLimits({
+          cliType: quotaConfig.cliType,
+          agentType: quotaConfig.agentType,
+          config: quotaConfig,
+          capability: quotaMachine?.acpCapabilities?.[session.agentConfigId]?.rateLimits,
+        })
+    );
     // Handle into the composer's mention machinery, for mentions that originate
     // outside it (a sidebar session dropped on the conversation).
     const mentionActionsRef = useRef<CombinedMentionTextareaHandle | null>(null);
@@ -1384,7 +1406,9 @@ export const SessionChatInputArea = memo(
         const text = event.clipboardData.getData('text/plain');
 
         // Cmd/Ctrl+Shift+V keeps a conversation URL as a plain link.
-        const sessionUrl = text ? parseAppSessionUrl(text) : null;
+        const sessionUrl = text
+          ? (readPastedSessionLink(text, workspaceId) ?? parseAppSessionUrl(text))
+          : null;
         if (sessionUrl) {
           if (isPlainLinkPasteShortcut(event)) {
             capturePostHogEvent(postHog, 'mention/session_link_pasted', {
@@ -1453,6 +1477,7 @@ export const SessionChatInputArea = memo(
         insertLargePastedTextAtSelection,
         insertSessionMention,
         isArchived,
+        workspaceId,
         postHog,
         t,
       ]
@@ -2081,6 +2106,7 @@ export const SessionChatInputArea = memo(
           {mobileFooterSelectorNode ?? desktopFooterSelectorNode}
         </div>
         <SessionUsagePopover
+          onRefreshQuota={refreshQuota}
           contextWindowUsage={session.contextWindowUsage}
           rateLimits={rateLimits}
           agentType={session.agentType}

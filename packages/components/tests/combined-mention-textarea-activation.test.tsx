@@ -89,6 +89,7 @@ describe('CombinedMentionTextarea mention enablement and activation', () => {
 
   afterEach(async () => {
     await act(async () => root.unmount());
+    vi.useRealTimers();
     container.remove();
     if (originalScrollIntoView) {
       HTMLElement.prototype.scrollIntoView = originalScrollIntoView;
@@ -302,6 +303,7 @@ describe('CombinedMentionTextarea mention enablement and activation', () => {
   });
 
   it('wraps ArrowUp from the first @ result and continues in reverse order', async () => {
+    vi.useFakeTimers();
     sessionItems.push(
       {
         sessionId: 's1',
@@ -327,6 +329,7 @@ describe('CombinedMentionTextarea mention enablement and activation', () => {
     );
     await render({ value: '' });
     await typeInto('@session:');
+    await act(async () => vi.advanceTimersToNextFrame());
 
     const input = textarea();
     if (!input) throw new Error('composer textarea missing');
@@ -551,7 +554,7 @@ describe('CombinedMentionTextarea mention enablement and activation', () => {
     expect(skillScanEnabled).toContain(true);
   });
 
-  it.each(['$', '￥'])('opens skills from %s and commits the dollar form', async (trigger) => {
+  it.each(['$', '￥', '¥'])('opens skills from %s and commits the dollar form', async (trigger) => {
     for (const token of ['review', 'research']) {
       skillItems.push({
         token,
@@ -581,22 +584,22 @@ describe('CombinedMentionTextarea mention enablement and activation', () => {
     expect(textarea()!.value.trimEnd()).toBe('Use $review');
   });
 
-  it.each(['$', '￥'])('keeps %s plain when skills are unavailable', async (trigger) => {
+  it.each(['$', '￥', '¥'])('keeps %s plain when skills are unavailable', async (trigger) => {
     await render({ value: '', availableCommands: [{ name: 'review', description: 'Review' }] });
     await typeInto(`${trigger}review`);
     expect(document.querySelector('[data-slot="mention-item"]')).toBeNull();
     expect(textarea()!.value).toBe(`${trigger}review`);
   });
 
-  it('preserves an unselected yuan query on dismissal', async () => {
+  it.each(['￥', '¥'])('preserves an unselected %s query on dismissal', async (trigger) => {
     await render({ value: '', skillAgent: { machineId: 'machine-1' } });
-    await typeInto('￥unknown');
+    await typeInto(`${trigger}unknown`);
     await act(async () => {
       textarea()!.dispatchEvent(
         new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true })
       );
     });
-    expect(textarea()!.value).toBe('￥unknown');
+    expect(textarea()!.value).toBe(`${trigger}unknown`);
     expect(document.querySelector('[data-slot="mention-item"]')).toBeNull();
   });
 
