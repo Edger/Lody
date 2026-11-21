@@ -4347,6 +4347,7 @@
   "sidebar.status.focus": "Focus",
   "sidebar.status.focusEmptyDrop": "Drag a conversation here to focus",
   "sidebar.status.later": "Later",
+  "sidebar.status.moveRefused": "Nothing moved: this would reorder conversations you can't manage.",
   "sidebar.status.settled": "Settled",
   "sidebar.status.snooze.quick1h": "1h",
   "sidebar.status.snooze.quick4h": "4h",
@@ -7028,5 +7029,16 @@
   "sessions.iosSimulator.action.stopOptions": "Stop preview options",
   "sessions.iosSimulator.action.stopPreviewOnly": "Stop preview only",
   "sessions.iosSimulator.action.stopAndShutdown": "Stop preview and shut down simulator",
-  "sessions.androidEmulator.action.stopAndShutdown": "Stop preview and shut down emulator"
+  "sessions.androidEmulator.action.stopAndShutdown": "Stop preview and shut down emulator",
+  "chat.mobileHome.swipeActions.settle": "Settle",
+  "chat.mobileHome.swipeActions.later": "Later",
+  "chat.mobileHome.later.title": "Later",
+  "chat.mobileHome.later.pastTime": "Choose a time in the future.",
+  "chat.mobileHome.later.confirmCustom": "Later until this time",
+  "chat.mobileHome.status.movedToLater": "Moved to Later",
+  "chat.mobileHome.status.settled": "Settled",
+  "chat.mobileHome.status.moveToTop": "Move to top",
+  "chat.mobileHome.status.moveUp": "Move up",
+  "chat.mobileHome.status.moveDown": "Move down",
+  "chat.mobileHome.filters.view.byStatus": "Group: Status"
 }
