@@ -13,7 +13,7 @@ on:
         type: string
 
 permissions:
-  contents: read
+  contents: write
 
 concurrency:
   group: build-fork-apk-${{ github.ref }}
@@ -113,9 +113,46 @@ jobs:
           apksigner="$(find "$ANDROID_SDK_ROOT/build-tools" -name apksigner | sort -V | tail -1)"
           "$apksigner" verify --print-certs "$apk"
 
+      - name: Stage APK
+        id: stage
+        run: |
+          set -euo pipefail
+          apk="$(ls apps/mobile/android/app/build/outputs/apk/release/*.apk | head -1)"
+          version=""
+          aapt="$(find "$ANDROID_SDK_ROOT/build-tools" -name aapt -type f 2>/dev/null | sort -V | tail -1 || true)"
+          if [[ -n "$aapt" ]]; then
+            version="$("$aapt" dump badging "$apk" | sed -n "s/.*versionName='\([^']*\)'.*/\1/p" | head -1)"
+          fi
+          if [[ -z "$version" ]]; then
+            version="$(sed -n 's/^[[:space:]]*versionName = "\([^"]*\)".*/\1/p' apps/mobile/android/app/build.gradle.kts | head -1)"
+          fi
+          if [[ -z "$version" ]]; then
+            version="unknown"
+          fi
+          name="lody-release-${version}-$(date -u +%Y%m%d-%H%M%S)-${GITHUB_SHA:0:7}"
+          mkdir -p dist
+          cp "$apk" "dist/${name}.apk"
+          echo "name=${name}" >> "$GITHUB_OUTPUT"
+          echo "apk=dist/${name}.apk" >> "$GITHUB_OUTPUT"
+          echo "Publishing ${name}"
+
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: lody-release-apk
-          path: apps/mobile/android/app/build/outputs/apk/release/*.apk
+          name: ${{ steps.stage.outputs.name }}
+          path: ${{ steps.stage.outputs.apk }}
           if-no-files-found: error
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NAME: ${{ steps.stage.outputs.name }}
+          APK: ${{ steps.stage.outputs.apk }}
+        run: |
+          set -euo pipefail
+          gh release create "$NAME" "$APK" \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "$NAME" \
+            --notes "Fork release APK for commit $GITHUB_SHA" \
+            --latest
