@@ -129,7 +129,7 @@ jobs:
           if [[ -z "$version" ]]; then
             version="unknown"
           fi
-          name="lody-release-${version}-$(date -u +%Y%m%d-%H%M%S)-${GITHUB_SHA:0:7}"
+          name="lody-release-${version}-$(date -u +%Y%m%dT%H%M%SZ)-${GITHUB_SHA:0:7}"
           mkdir -p dist
           cp "$apk" "dist/${name}.apk"
           echo "name=${name}" >> "$GITHUB_OUTPUT"
