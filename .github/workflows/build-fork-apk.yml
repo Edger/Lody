@@ -30,7 +30,7 @@ jobs:
           persist-credentials: false
 
       - name: Check out native Android client
-        run: git submodule update --init apps/mobile/android
+        run: git submodule update --init --remote apps/mobile/android
 
       - name: Set up JDK
         uses: actions/setup-java@v4
