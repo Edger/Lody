@@ -249,6 +249,9 @@ export interface LoroSidebarProps {
    */
   pinnedHiddenCounts?: Readonly<Record<string, number>>;
   onTogglePinSection?: (sectionId: string) => void;
+  /** Pin sections hidden on this device, by `pinSectionKey(section.id)`. */
+  hiddenPinSectionKeys?: Readonly<Record<string, boolean>>;
+  onSetPinSectionHidden?: (sectionKey: string, hidden: boolean) => void;
   /** Create, rename, delete and move between pin sections; absent hides those controls. */
   pinSectionActions?: SidebarPinSectionActions;
   /** Selected item id used to highlight a row in 'updated' mode. */
@@ -256,11 +259,11 @@ export interface LoroSidebarProps {
   /** Per-bucket collapse state for the 'updated' organize mode. */
   updatedBucketsCollapsed?: Partial<Record<SidebarUpdatedBucketKey, boolean>>;
   /**
-   * Per-bucket "show all" state for the 'updated' organize mode. Buckets above
-   * the threshold default to a compact preview; this map records which buckets
-   * the user has expanded.
+   * Per-bucket incremental reveal for the 'updated' organize mode. Buckets
+   * above the threshold default to a compact preview; each entry counts extra
+   * top-level rows "Show more" has uncovered beyond it.
    */
-  updatedShowFullBuckets?: Partial<Record<SidebarUpdatedBucketKey, boolean>>;
+  updatedRevealedRows?: Partial<Record<SidebarUpdatedBucketKey, number>>;
   /**
    * Loading state for the 'updated' organize mode. When true and there are no
    * items yet, the list renders a skeleton instead of the empty state — keeps
@@ -281,7 +284,8 @@ export interface LoroSidebarProps {
   onSelectUpdatedItem?: (id: string, tabSessionId?: string) => void;
   onTogglePinnedSection?: () => void;
   onToggleUpdatedBucket?: (key: SidebarUpdatedBucketKey) => void;
-  onToggleUpdatedShowFullBucket?: (key: SidebarUpdatedBucketKey) => void;
+  onShowMoreUpdatedRows?: (key: SidebarUpdatedBucketKey) => void;
+  onShowLessUpdatedRows?: (key: SidebarUpdatedBucketKey) => void;
   /**
    * Archive a session from the 'updated' organize mode. Mirrors `sessionListProps.onArchiveSession`
    * so both organize modes share the same destination handler.
@@ -301,6 +305,11 @@ export interface LoroSidebarProps {
   onMoveUpdatedItemToFocus?: (id: string) => void;
   /** Reorder, restore or unpin (via drag) a session into Status Focus at `toIndex`. */
   onDropFocusItem?: (id: string, toIndex: number) => void;
+  /**
+   * The synced server clock the Status view was laid out at; rows, tiers and
+   * countdowns use it so they agree with the planned drops. Defaults to a local tick.
+   */
+  statusNow?: Date;
   /** Copy session URL for an Updated row. Mirrors `sessionListProps.onCopySessionUrl`. */
   onCopyUpdatedItemUrl?: (id: string) => void;
   /** Share an Updated row with the team. Mirrors `sessionListProps.onShareSessionWithTeam`. */
@@ -843,10 +852,12 @@ export const LoroSidebar = memo(function LoroSidebar({
   collapsedPinSectionIds,
   pinnedHiddenCounts,
   onTogglePinSection,
+  hiddenPinSectionKeys,
+  onSetPinSectionHidden,
   pinSectionActions,
   updatedSelectedItemId,
   updatedBucketsCollapsed,
-  updatedShowFullBuckets,
+  updatedRevealedRows,
   updatedIsLoading = false,
   showUpdatedProjectNames = true,
   onShowUpdatedProjectNamesChange,
@@ -859,7 +870,8 @@ export const LoroSidebar = memo(function LoroSidebar({
   onSelectUpdatedItem,
   onTogglePinnedSection,
   onToggleUpdatedBucket,
-  onToggleUpdatedShowFullBucket,
+  onShowMoreUpdatedRows,
+  onShowLessUpdatedRows,
   onArchiveUpdatedItem,
   onMarkUpdatedItemUnread,
   onRenameUpdatedItem,
@@ -868,6 +880,7 @@ export const LoroSidebar = memo(function LoroSidebar({
   onSettleUpdatedItem,
   onMoveUpdatedItemToFocus,
   onDropFocusItem,
+  statusNow,
   onCopyUpdatedItemUrl,
   onShareUpdatedItemWithTeam,
   onOpenUpdatedItemPullRequest,
@@ -925,7 +938,8 @@ export const LoroSidebar = memo(function LoroSidebar({
     filter: { ...defaultLabels.filter, ...(labels?.filter ?? {}) },
     updated: { ...defaultLabels.updated, ...(labels?.updated ?? {}) },
   };
-  const now = useStableNow();
+  const localNow = useStableNow();
+  const now = statusNow ?? localNow;
   const mobileResize = minWidth === undefined && isMobileSidebarDevice();
   const resolvedMinWidth = Math.max(
     160,
@@ -1593,9 +1607,6 @@ export const LoroSidebar = memo(function LoroSidebar({
             // first group is set off like the 16px between the groups below it.
             isMobile ? 'mt-4 pb-[calc(12px+env(safe-area-inset-bottom,0px))]' : 'mt-3'
           )}
-          // Overlay only while the list is scrolling. ScrollArea defaults to `hover`,
-          // which paints the thumb as soon as the pointer enters the sidebar.
-          visibility="scroll"
           // The horizontal gutter must live on the *viewport*, not the ScrollArea
           // root. The viewport is the scroll/clip container; with rows at
           // `w-full` and the gutter on the root, the selected row's 1px `outline`
@@ -1621,6 +1632,8 @@ export const LoroSidebar = memo(function LoroSidebar({
                   collapsedSectionIds={collapsedPinSectionIds}
                   hiddenCounts={pinnedHiddenCounts}
                   onToggleSection={onTogglePinSection}
+                  hiddenSectionKeys={hiddenPinSectionKeys}
+                  onSetSectionHidden={onSetPinSectionHidden}
                   headerAction={sectionHeaderFilterAction ?? undefined}
                   actions={pinSectionActions}
                   onDropIntoFocus={organizeMode === 'status' ? onDropFocusItem : undefined}
@@ -1655,10 +1668,11 @@ export const LoroSidebar = memo(function LoroSidebar({
                     selectedItemId={updatedSelectedItemId ?? null}
                     labels={mergedLabels.updated}
                     collapsedBuckets={updatedBucketsCollapsed}
-                    showFullBuckets={updatedShowFullBuckets}
+                    revealedRowsByBucket={updatedRevealedRows}
                     onSelectItem={onSelectUpdatedItem}
                     onToggleBucket={onToggleUpdatedBucket}
-                    onToggleFullBucket={onToggleUpdatedShowFullBucket}
+                    onShowMore={onShowMoreUpdatedRows}
+                    onShowLess={onShowLessUpdatedRows}
                     onArchiveItem={onArchiveUpdatedItem}
                     onMarkItemUnread={onMarkUpdatedItemUnread}
                     onRenameItem={onRenameUpdatedItem}

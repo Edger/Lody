@@ -18,6 +18,8 @@ import {
   type FocusIntent,
   type TodayFragment,
   type TodayDate,
+  type TodayNodeView,
+  type TodayMentionTarget,
   type TodayNodeId,
 } from '@lody/shared';
 import type { TodayPageStore } from '@/lib/today/today-page-store';
@@ -37,6 +39,7 @@ import {
   blockRange,
   parseTodayClipboard,
   resolveBlockKey,
+  escalateSelection,
   extendFocus,
   selectionCovers,
   linkifyTodayFragments,
@@ -91,7 +94,9 @@ export type TodaySessionPickerState = {
   index: number;
   /** Offset of the `@`; the mention replaces `start..start + 1 + query.length`. */
   start: number;
+  tab: TodayPickerTab;
 };
+export type TodayPickerTab = 'all' | 'member' | 'session';
 /**
  * An `@` (or full-width `＠`) at the line start or after whitespace, then the
  * query up to the caret: no newline and no other mention inside it.
@@ -147,13 +152,11 @@ export class TodayEditorController {
   /** The `@` the user dismissed with Esc (`nodeId:offset`): it stays closed. */
   private pickerDismissedFor: string | null = null;
   /** Candidates the picker currently shows, set by its view. */
-  pickerItems: readonly string[] = [];
+  pickerItems: readonly TodayMentionTarget[] = [];
   private dropIndicator: TodayDropIndicator | null = null;
   private dragGhost: TodayDragGhost | null = null;
   private cancelSettle: (() => void) | null = null;
-  /** Opens the node menu for a bullet clicked without dragging (wired by the host). */
-  onNodeMenu: ((store: TodayPageStore, nodeId: TodayNodeId, anchor: HTMLElement) => void) | null =
-    null;
+  private pointerSelecting = false;
   /** Workspace whose session links may be pasted into a node. */
   workspaceId: string | null = null;
   /** Plain-text form of a mention in copies and the Convert to task prompt (set by the host). */
@@ -259,7 +262,14 @@ export class TodayEditorController {
           this.picker.start === start &&
           this.picker.query === query;
         if (same) return;
-        this.picker = { store: active.store, nodeId: active.nodeId, query, index: 0, start };
+        this.picker = {
+          store: active.store,
+          nodeId: active.nodeId,
+          query,
+          index: 0,
+          start,
+          tab: this.picker?.tab ?? 'all',
+        };
         this.notify();
       })
     );
@@ -281,12 +291,12 @@ export class TodayEditorController {
   isBlockSelected(store: TodayPageStore, nodeId: TodayNodeId) {
     if (this.selection?.store !== store) return false;
     // Descendants of a selected row are acted on with it, so they show as selected.
-    const snapshot = store.getSnapshot();
-    if (this.coveredFor?.snapshot !== snapshot || this.coveredFor.ids !== this.selection.ids) {
+    const rows = this.rowsOf(store);
+    if (this.coveredFor?.snapshot !== rows || this.coveredFor.ids !== this.selection.ids) {
       this.coveredFor = {
-        snapshot,
+        snapshot: rows,
         ids: this.selection.ids,
-        covered: selectionCovers(snapshot.visible, this.selection.ids),
+        covered: selectionCovers(rows, this.selection.ids),
       };
     }
     return this.coveredFor.covered.has(nodeId);
@@ -300,6 +310,12 @@ export class TodayEditorController {
   getEditorRoot() {
     return this.root;
   }
+  getSurface() {
+    return this.surface;
+  }
+  isSelectingByPointer() {
+    return this.pointerSelecting;
+  }
   getDropIndicator() {
     return this.dropIndicator;
   }
@@ -309,13 +325,14 @@ export class TodayEditorController {
 
   // --- drag and drop ------------------------------------------------------
   private dayRows(store: TodayPageStore, day: Element) {
-    const nodes = new Map(store.getSnapshot().visible.map((node) => [node.id, node] as const));
+    const nodes = new Map(this.rowsOf(store).map((node) => [node.id, node] as const));
     const rows: TodayDropRow[] = [];
     let contentLeft = day.getBoundingClientRect().left;
     let right = day.getBoundingClientRect().right;
+    const root = this.zoomRoot(store);
     for (const element of day.querySelectorAll<HTMLElement>('[data-today-node]')) {
       const node = nodes.get(element.dataset.todayNode as TodayNodeId);
-      if (!node) continue;
+      if (!node || node.id === root) continue;
       const rect = element.getBoundingClientRect();
       if (node.depth === 0) {
         contentLeft = rect.left;
@@ -371,16 +388,14 @@ export class TodayEditorController {
     sessionId?: string
   ) {
     const moving = new Set<string>(ids ?? []);
-    const siblings = store.outline
-      .getAllNodes()
-      .filter((node) => node.parentId === target.parentId && !moving.has(node.id));
+    const parentId = (target.parentId ?? this.zoomRoot(store)) as TodayNodeId | null;
+    const siblings = store.outline.childIds(parentId).filter((id) => !moving.has(id));
     const index =
       target.after === null
         ? 0
         : target.after === 'end'
           ? siblings.length
-          : siblings.findIndex((node) => node.id === target.after) + 1;
-    const parentId = target.parentId as TodayNodeId | null;
+          : siblings.indexOf(target.after as TodayNodeId) + 1;
     store.undo.structural(() => {
       if (target.expandParent && parentId) store.outline.setCollapsed(parentId, false);
       if (ids) store.outline.moveTo(ids, { parentId, index });
@@ -392,7 +407,7 @@ export class TodayEditorController {
 
   /**
    * Bullet pressed: after 5px it drags the node (or the whole block selection
-   * it belongs to) within its day; a press without movement opens the menu.
+   * it belongs to) within its day; a press without movement zooms into the node.
    */
   beginNodeDrag(
     store: TodayPageStore,
@@ -407,7 +422,7 @@ export class TodayEditorController {
       this.selection?.store === store && this.selection.ids.includes(nodeId)
         ? this.selection.ids
         : [nodeId];
-    const ids = topLevelSelection(store.getSnapshot().visible, selection);
+    const ids = topLevelSelection(this.rowsOf(store), selection);
     const label = store.outline.getNode(ids[0]!)?.text ?? '';
     // Horizontal movement from the grab point changes depth, one indent per level.
     const depthOrigin =
@@ -450,7 +465,10 @@ export class TodayEditorController {
         );
       } else if (wasDragging) this.notify();
       if (drop) this.dropAt(store, drop, ids);
-      if (commit && !wasDragging) this.onNodeMenu?.(store, nodeId, bullet);
+      if (commit && !wasDragging) {
+        if (this.onZoom) this.onZoom(store, nodeId);
+        else if (!this.isBlockSelected(store, nodeId)) this.selectBlocks(store, [nodeId]);
+      }
     };
     const move = (event: PointerEvent) => {
       // The release happened where we could not see it (another window or app):
@@ -584,10 +602,10 @@ export class TodayEditorController {
       }
       case 'Enter':
       case 'Tab': {
-        const sessionId = this.pickerItems[picker.index];
-        if (!sessionId) return false;
+        const target = this.pickerItems[picker.index];
+        if (!target) return false;
         event.preventDefault();
-        queueMicrotask(() => this.acceptPicker(sessionId));
+        queueMicrotask(() => this.acceptPicker(target));
         return true;
       }
       case 'Escape':
@@ -604,23 +622,83 @@ export class TodayEditorController {
   }
 
   /** Replace the `@query` with a mention; one undo brings `@query` back. */
-  acceptPicker(sessionId: string) {
+  acceptPicker(target: TodayMentionTarget) {
     const picker = this.picker;
     if (!picker) return;
     this.picker = null;
     const { store, nodeId, start, query } = picker;
     const focus = store.undo.structural(() =>
-      store.outline.insertMention(nodeId, start, query.length + 1, {
-        kind: 'session',
-        id: sessionId,
-      })
+      store.outline.insertMention(nodeId, start, query.length + 1, target)
     );
     this.apply(store, focus);
+  }
+
+  setPickerTab(tab: TodayPickerTab) {
+    if (!this.picker || this.picker.tab === tab) return;
+    this.picker = { ...this.picker, tab, index: 0 };
+    this.notify();
+  }
+
+  onOpenMember: ((userId: string) => void) | null = null;
+
+  private readonly reveals = new Map<TodayPageStore, (nodeId: TodayNodeId) => void>();
+  /** The focused day, or a node zoomed into: keys, selection and drops stay inside it. */
+  private focus: { date: TodayDate; rootId: TodayNodeId | null } | null = null;
+  private zoomRows: { from: object; rows: readonly TodayNodeView[] } | null = null;
+  /** Zooms into a node: a bullet click or ⌥→ (wired by the host). */
+  onZoom: ((store: TodayPageStore, nodeId: TodayNodeId) => void) | null = null;
+  /** Leaves one level of focus: ⌥← (wired by the host). */
+  onZoomOut: (() => void) | null = null;
+  /** Opens a node's menu at its "⋯" button or the pointer (wired by the host). */
+  onNodeMenu:
+    | ((
+        store: TodayPageStore,
+        nodeId: TodayNodeId,
+        anchor: HTMLElement | { x: number; y: number }
+      ) => void)
+    | null = null;
+
+  setFocus(focus: { date: TodayDate; rootId: TodayNodeId | null } | null) {
+    if (this.focus?.date === focus?.date && this.focus?.rootId === focus?.rootId) return;
+    this.focus = focus;
+    this.zoomRows = null;
+    this.coveredFor = null;
+    this.clearBlockSelection();
+  }
+
+  /** The node a day is zoomed into, if `store` is that day. */
+  zoomRoot(store: TodayPageStore): TodayNodeId | null {
+    return this.focus && this.focus.date === store.date ? this.focus.rootId : null;
+  }
+
+  /**
+   * The rows keys and selection walk: the page's visible rows, or, zoomed in,
+   * the zoomed node (depth -1) followed by its subtree.
+   */
+  rowsOf(store: TodayPageStore): readonly TodayNodeView[] {
+    const root = this.zoomRoot(store);
+    if (!root) return store.getSnapshot().visible;
+    const subtree = store.outline.getSubtree(root);
+    if (!subtree) return [];
+    if (this.zoomRows?.from === subtree) return this.zoomRows.rows;
+    const node = store.outline.getNode(root);
+    const rows = node ? [{ ...node, depth: -1 }, ...subtree.visible] : [];
+    this.zoomRows = { from: subtree, rows };
+    return rows;
+  }
+
+  /** A virtualized page scrolls a row it has not mounted into view. */
+  registerReveal(store: TodayPageStore, reveal: (nodeId: TodayNodeId) => void) {
+    this.reveals.set(store, reveal);
+    return () => {
+      if (this.reveals.get(store) === reveal) this.reveals.delete(store);
+    };
   }
 
   /** Sections register their open page so the caret can cross days. */
   registerDay(date: TodayDate, store: TodayPageStore) {
     this.days.set(date, store);
+    this.notify();
     return () => {
       if (this.days.get(date) === store) this.days.delete(date);
     };
@@ -664,7 +742,8 @@ export class TodayEditorController {
     const row = this.surface?.querySelector<HTMLElement>(
       `[data-today-node="${CSS.escape(nodeId)}"]`
     );
-    row?.scrollIntoView?.({ block: 'nearest' });
+    if (row) row.scrollIntoView?.({ block: 'nearest' });
+    else if (this.selection) this.reveals.get(this.selection.store)?.(nodeId);
   }
 
   clearBlockSelection() {
@@ -694,8 +773,9 @@ export class TodayEditorController {
     event.preventDefault();
     const { store } = selection;
     const outline = store.outline;
-    const visible = store.getSnapshot().visible;
-    const roots = topLevelSelection(visible, selection.ids);
+    const visible = this.rowsOf(store);
+    const zoomRoot = this.zoomRoot(store);
+    const roots = topLevelSelection(visible, selection.ids).filter((id) => id !== zoomRoot);
     const keep = () =>
       this.selectBlocks(store, selection.ids, {
         anchor: this.blockAnchor ?? undefined,
@@ -718,7 +798,7 @@ export class TodayEditorController {
         return true;
       }
       case 'delete':
-        this.deleteBlocks(store, roots);
+        if (roots.length > 0) this.deleteBlocks(store, roots);
         return true;
       case 'step': {
         // Leave the range from its top (Up) or bottom (Down) edge.
@@ -753,19 +833,36 @@ export class TodayEditorController {
         this.revealRow(next);
         return true;
       }
-      case 'select-all':
-        this.selectBlocks(
-          store,
-          visible.map((node) => node.id)
-        );
+      case 'select-all': {
+        if (zoomRoot && selection.ids.includes(zoomRoot)) return true;
+        const next = escalateSelection(visible, selection.ids);
+        if (next) this.selectBlocks(store, next);
+        return true;
+      }
+      case 'zoom-in': {
+        const target = this.blockFocus ?? selection.ids.at(-1);
+        if (target && target !== zoomRoot) this.onZoom?.(store, target);
+        return true;
+      }
+      case 'zoom-out':
+        this.onZoomOut?.();
+        return true;
+      case 'cycle-todo':
+        this.cycleSelectionTodo();
         return true;
       case 'indent':
       case 'outdent':
       case 'move-up':
-      case 'move-down':
-        store.undo.structural(() => OUTLINE_MOVES[intent.type](outline, roots));
+      case 'move-down': {
+        const leavesZoom =
+          intent.type === 'outdent' &&
+          roots.some((id) => outline.getNode(id)?.parentId === zoomRoot);
+        if (roots.length > 0 && !(zoomRoot && leavesZoom)) {
+          store.undo.structural(() => OUTLINE_MOVES[intent.type](outline, roots));
+        }
         keep();
         return true;
+      }
     }
   }
 
@@ -774,7 +871,7 @@ export class TodayEditorController {
     const selection = this.selection;
     if (!selection || !event.clipboardData) return false;
     const { store } = selection;
-    const roots = topLevelSelection(store.getSnapshot().visible, selection.ids);
+    const roots = topLevelSelection(this.rowsOf(store), selection.ids);
     const fragments = store.outline.extract(roots);
     event.preventDefault();
     event.clipboardData.setData('text/plain', serializeTodayFragments(fragments, this.mentionText));
@@ -784,6 +881,34 @@ export class TodayEditorController {
     );
     if (cut) this.deleteBlocks(store, roots);
     return true;
+  }
+
+  cycleSelectionTodo() {
+    const selection = this.selection;
+    if (!selection) return;
+    const { store, ids } = selection;
+    store.undo.structural(() => store.outline.cycleTodo(ids));
+  }
+
+  toggleDone(store: TodayPageStore, nodeId: TodayNodeId) {
+    const state = store.outline.getNode(nodeId)?.todo;
+    if (!state) return;
+    store.undo.structural(() =>
+      store.outline.setTodo([nodeId], state === 'done' ? 'todo' : 'done')
+    );
+  }
+
+  copySelection() {
+    if (!this.selection || !this.surface) return;
+    this.surface.focus({ preventScroll: true });
+    this.surface.ownerDocument.execCommand('copy');
+  }
+
+  deleteSelection() {
+    const selection = this.selection;
+    if (!selection) return;
+    const { store } = selection;
+    this.deleteBlocks(store, topLevelSelection(this.rowsOf(store), selection.ids));
   }
 
   private deleteBlocks(store: TodayPageStore, roots: TodayNodeId[]) {
@@ -801,7 +926,7 @@ export class TodayEditorController {
     if (!selection || !fragments) return false;
     event.preventDefault();
     const { store } = selection;
-    const roots = topLevelSelection(store.getSnapshot().visible, selection.ids);
+    const roots = topLevelSelection(this.rowsOf(store), selection.ids);
     const after = roots.at(-1);
     if (!after) return true;
     this.apply(
@@ -886,7 +1011,7 @@ export class TodayEditorController {
           ? this.active.nodeId
           : null;
     if (event.shiftKey && extendFrom) {
-      const visible = store.getSnapshot().visible;
+      const visible = this.rowsOf(store);
       this.selectBlocks(store, blockRange(visible, extendFrom, nodeId), {
         anchor: extendFrom,
         focus: nodeId,
@@ -933,7 +1058,7 @@ export class TodayEditorController {
       if (!target || target === last) return;
       last = target;
       if (target !== anchor) {
-        const visible = store.getSnapshot().visible;
+        const visible = this.rowsOf(store);
         this.selectBlocks(store, blockRange(visible, anchor, target), { anchor, focus: target });
       } else if (this.selection) {
         this.activate(store, anchor, 'end');
@@ -944,7 +1069,10 @@ export class TodayEditorController {
       window.removeEventListener('pointerup', stop);
       window.removeEventListener('blur', stop);
       this.stopPointer = null;
+      this.pointerSelecting = false;
+      if (this.selection) this.notify();
     };
+    this.pointerSelecting = true;
     window.addEventListener('pointermove', move);
     window.addEventListener('pointerup', stop);
     window.addEventListener('blur', stop);
@@ -1134,7 +1262,7 @@ export class TodayEditorController {
       // longer belongs to it.
       const current = this.active;
       if (current?.store !== active.store || current.nodeId !== active.nodeId) return;
-      if (intent.type === 'select-from-text') {
+      if (intent.type === 'select-from-text' && active.nodeId !== this.zoomRoot(active.store)) {
         // Remember the text selection so Esc can return to it.
         const origin = {
           store: active.store,
@@ -1161,7 +1289,37 @@ export class TodayEditorController {
     const { store, nodeId } = active;
     const outline = store.outline;
     const keepCaret = () => this.activate(store, nodeId, offset);
+    const root = this.zoomRoot(store);
+    if (root && nodeId === root) {
+      if (intent.type === 'split' || intent.type === 'enter-empty') {
+        return this.apply(
+          store,
+          store.undo.structural(() => {
+            if (end > offset) outline.getText(nodeId)?.delete(offset, end - offset);
+            return outline.split(nodeId, offset, { intoChildren: true });
+          })
+        );
+      }
+      if (
+        intent.type === 'merge-previous' ||
+        intent.type === 'indent' ||
+        intent.type === 'outdent' ||
+        intent.type === 'move-up' ||
+        intent.type === 'move-down' ||
+        intent.type === 'block-select' ||
+        intent.type === 'select-from-text'
+      ) {
+        return keepCaret();
+      }
+    }
+    if (root && intent.type === 'outdent' && outline.getNode(nodeId)?.parentId === root) {
+      return keepCaret();
+    }
     switch (intent.type) {
+      case 'zoom-in':
+        return this.onZoom?.(store, nodeId);
+      case 'zoom-out':
+        return this.onZoomOut?.();
       case 'split':
         // Enter over a selection replaces it, as typing would: one undo step.
         return this.apply(
@@ -1207,6 +1365,9 @@ export class TodayEditorController {
         return this.focusNeighbour(store, nodeId, 1, 'start');
       case 'block-select':
         return this.selectBlocks(store, [nodeId]);
+      case 'cycle-todo':
+        store.undo.structural(() => outline.cycleTodo([nodeId]));
+        return keepCaret();
       case 'extend-text':
         this.editor.update(() => $setSelectionOffsets(intent.anchor, intent.focus), {
           discrete: true,
@@ -1228,10 +1389,11 @@ export class TodayEditorController {
     step: -1 | 1,
     caret: CaretTarget
   ) {
-    const visible = store.getSnapshot().visible;
+    const visible = this.rowsOf(store);
     const index = visible.findIndex((node) => node.id === nodeId);
     const inPage = index < 0 ? undefined : visible[index + step];
     if (inPage) return this.activate(store, inPage.id, caret);
+    if (this.focus) return;
     const ordered = [...this.days.entries()].sort(([a], [b]) => (a < b ? 1 : -1));
     const dayIndex = ordered.findIndex(([, page]) => page === store);
     for (let next = dayIndex + step; next >= 0 && next < ordered.length; next += step) {

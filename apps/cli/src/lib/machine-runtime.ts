@@ -49,11 +49,9 @@ export class MachineRuntime {
     request: import('@lody/shared/local-machine-rpc').LocalMachineRpcRequest,
     context?: EncryptedFeatureContext
   ) {
-    if (
-      (request.method === 'sorbet/credentials-list' ||
-        request.method === 'sorbet/credentials-logout') &&
-      !context
-    )
+    // Sorbet's credential and Provider stores are the owner's: every method,
+    // read or write, needs the verified signer context.
+    if (request.method.startsWith('sorbet/') && !context)
       throw new Error('e2ee_feature_unavailable');
     const config = this.options.handlerConfig;
     if (
@@ -70,6 +68,21 @@ export class MachineRuntime {
       return this.requireHandler().handleEncryptedSessionFork(
         request.params,
         requester.executionUserId
+      );
+    }
+    if (request.method === 'local-project/list-branches') {
+      const requester = context?.requester;
+      if (!requester || request.params.requestedByUserId !== requester.accountId)
+        throw new Error('e2ee_feature_requester');
+      return this.requireHandler().readEncryptedMachineRequest(
+        {
+          ...request,
+          params: {
+            ...request.params,
+            requestedByUserId: requester.executionUserId,
+          },
+        },
+        context
       );
     }
     if ('requestedByUserId' in request.params && request.params.requestedByUserId !== config.userId)

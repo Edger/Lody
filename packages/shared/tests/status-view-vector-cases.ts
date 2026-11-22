@@ -202,6 +202,76 @@ export const LAYOUT_CASES: LayoutCase[] = [
       { canManageSections: false }
     ),
   },
+  {
+    name: 'pinned-root-carries-opened-rows-at-any-depth',
+    description:
+      'A row opened by a row the pinned root opened follows the root into its section and nests under it, like the direct child.',
+    input: layoutInput(
+      [
+        session('root', { isPinned: true, pinSectionId: 'work', orderKey: K1 }),
+        session('child', { openedById: 'root' }),
+        session('grandchild', { openedById: 'child' }),
+        session('other-pin', { isPinned: true, orderKey: K2 }),
+      ],
+      { sections: [section('work', K2, 'Work')] }
+    ),
+  },
+  {
+    name: 'all-zero-order-key-reads-as-no-key',
+    description:
+      'An all-zero order key has no key before it, so Focus orders that row as unkeyed rather than failing later.',
+    input: layoutInput([session('zero', { orderKey: '00' }), session('keyed', { orderKey: K2 })]),
+  },
+  {
+    name: 'placed-woken-row-keeps-unread-at-its-place',
+    description:
+      'A woken row placed by a Focus reorder (focusRestoredAt at its wake-up, expired snoozedUntil kept) orders by its key and stays unread; an unplaced woken row still floats.',
+    input: layoutInput([
+      session('f1', { orderKey: K1 }),
+      session('placed-woken', {
+        orderKey: K2,
+        lastMessageAt: NOW - 3 * DAY,
+        lastReadAt: NOW - 3 * DAY,
+        snoozedUntil: NOW - 2 * HOUR,
+        focusRestoredAt: NOW - 2 * HOUR,
+      }),
+      session('f3', { orderKey: K3 }),
+      session('fresh-woken', {
+        lastMessageAt: NOW - 3 * DAY,
+        lastReadAt: NOW - 3 * DAY,
+        snoozedUntil: NOW - HOUR,
+      }),
+    ]),
+  },
+  {
+    name: 'placed-woken-row-read-clears-unread',
+    description:
+      'Opening the placed row moves the read receipt past its wake-up and clears unread.',
+    input: layoutInput([
+      session('placed-woken', {
+        orderKey: K2,
+        lastMessageAt: NOW - 3 * DAY,
+        lastReadAt: NOW - MINUTE,
+        snoozedUntil: NOW - 2 * HOUR,
+        focusRestoredAt: NOW - 2 * HOUR,
+      }),
+    ]),
+  },
+  {
+    name: 'placed-row-re-snoozed-floats-again',
+    description:
+      'A placed row snoozed again wakes past its earlier placement, so it floats to the top again.',
+    input: layoutInput([
+      session('f1', { orderKey: K1 }),
+      session('re-woken', {
+        orderKey: K3,
+        lastMessageAt: NOW - 3 * DAY,
+        lastReadAt: NOW - 2 * DAY,
+        snoozedUntil: NOW - 10 * MINUTE,
+        focusRestoredAt: NOW - 2 * DAY,
+      }),
+    ]),
+  },
 ];
 
 const state = (
@@ -335,6 +405,128 @@ export const COMMAND_CASES: CommandCase[] = [
     description: 'A pinned row dropped into Focus leaves the Pinned area at the drop slot.',
     state: state(focusList),
     command: { type: 'move', sessionId: 'pinned-row', to: { area: 'focus' }, beforeId: 'f2' },
+  },
+  {
+    name: 'move-woken-row-keeps-its-wake-up',
+    description:
+      'Dragging a woken row places it by key and records focusRestoredAt at its wake-up; its expired snoozedUntil stays, so it remains unread.',
+    state: state(focusList),
+    command: { type: 'move', sessionId: 'woke-b', to: { area: 'focus' }, beforeId: 'f3' },
+  },
+  {
+    name: 'later-reorder-keeps-a-placed-woken-row',
+    description:
+      'A woken row placed by an earlier reorder no longer floats, so a later reorder leaves it where it is and writes nothing to it.',
+    state: state([
+      session('placed-woken', {
+        orderKey: K1,
+        snoozedUntil: NOW - 2 * HOUR,
+        focusRestoredAt: NOW - 2 * HOUR,
+      }),
+      session('f2', { orderKey: K2 }),
+      session('f3', { orderKey: K3 }),
+    ]),
+    command: { type: 'move', sessionId: 'f3', to: { area: 'focus' }, beforeId: 'f2' },
+  },
+  {
+    name: 'pinned-woken-row-dropped-into-focus-keeps-its-wake-up',
+    description:
+      'A pinned row with an expired snooze dropped into Focus is unpinned and placed without clearing the snooze, so it stays unread.',
+    state: state([
+      session('f1', { orderKey: K1 }),
+      session('f2', { orderKey: K2 }),
+      session('pinned-woken', {
+        isPinned: true,
+        orderKey: K3,
+        lastReadAt: NOW - 2 * DAY,
+        snoozedUntil: NOW - HOUR,
+      }),
+    ]),
+    command: { type: 'move', sessionId: 'pinned-woken', to: { area: 'focus' }, beforeId: 'f2' },
+  },
+  {
+    name: 'drop-restores-opened-child-keeping-its-wake-up',
+    description:
+      'A Later row dropped into Focus restores its opened sub-conversations; a woken child keeps its expired snooze, so it stays unread, while a future snooze is cleared.',
+    state: state([
+      session('f1', { orderKey: K1 }),
+      session('later-parent', { snoozedUntil: NOW + DAY }),
+      session('woken-child', {
+        openedById: 'later-parent',
+        lastReadAt: NOW - 2 * DAY,
+        snoozedUntil: NOW - HOUR,
+      }),
+    ]),
+    command: { type: 'move', sessionId: 'later-parent', to: { area: 'focus' }, beforeId: 'f1' },
+  },
+  {
+    name: 'move-to-focus-tree-keeps-woken-child-wake-up',
+    description:
+      'Move to Focus with its opened sub-conversations clears a future snooze and settle state but keeps an expired snooze on a woken child.',
+    state: state([
+      session('settled-parent', { settledAt: NOW - HOUR, lastMessageAt: NOW - 2 * HOUR }),
+      session('woken-child', {
+        openedById: 'settled-parent',
+        lastReadAt: NOW - 2 * DAY,
+        snoozedUntil: NOW - HOUR,
+      }),
+      session('later-child', { openedById: 'settled-parent', snoozedUntil: NOW + HOUR }),
+    ]),
+    command: { type: 'moveToFocus', sessionId: 'settled-parent', includeOpened: true },
+  },
+  {
+    name: 'new-session-order-ignores-an-all-zero-key',
+    description:
+      'An all-zero key cannot have a key above it; the new top key is planned from the real keys.',
+    state: state([session('zero', { orderKey: '0000' }), session('keyed', { orderKey: K2 })]),
+    command: { type: 'newSessionOrder', sessionId: 'brand-new' },
+  },
+  {
+    name: 'move-to-focus-top-over-an-all-zero-key',
+    description:
+      'Moving above a row with an all-zero key gives that row a real key instead of failing.',
+    state: state([session('zero', { orderKey: '00' }), session('f1', { orderKey: K2 })]),
+    command: { type: 'move', sessionId: 'f1', to: { area: 'focus' }, beforeId: 'zero' },
+  },
+  {
+    name: 'pin-lands-above-a-pin-whose-section-was-deleted',
+    description:
+      'A pin naming a deleted section shows in the default section, so a new pin is keyed above it too.',
+    state: state(
+      [
+        session('orphan', { isPinned: true, pinSectionId: 'deleted', orderKey: K1 }),
+        session('default-pin', { isPinned: true, orderKey: K2 }),
+        session('focus-row', { orderKey: K3 }),
+      ],
+      { sections: [section('work', K3, 'Work')] }
+    ),
+    command: { type: 'setPinned', sessionId: 'focus-row', pinned: true },
+  },
+  {
+    name: 'pin-move-before-sections-load-ignores-held-back-rows',
+    description:
+      'Before the section rows are read, a pin naming a section is held back from the default section, so it is not a neighbor there.',
+    state: state(
+      [
+        session('held', { isPinned: true, pinSectionId: 'work', orderKey: K1 }),
+        session('default-pin', { isPinned: true, orderKey: K2 }),
+        session('focus-row', { orderKey: K3 }),
+      ],
+      { sectionsLoaded: false }
+    ),
+    command: {
+      type: 'move',
+      sessionId: 'focus-row',
+      to: { area: 'pinned', sectionId: null },
+      beforeId: 'default-pin',
+    },
+  },
+  {
+    name: 'settle-covers-activity-newer-than-the-clock',
+    description:
+      'settledAt is never before the row activity (contained Tabs included), so a Tab clock running ahead cannot keep the row out of Settled.',
+    state: state([session('ahead', { lastMessageAt: NOW - HOUR, activityAt: NOW + 2 * MINUTE })]),
+    command: { type: 'settle', sessionId: 'ahead', includeOpened: false },
   },
   {
     name: 'move-in-focus-over-read-only-unkeyed-row-is-refused',

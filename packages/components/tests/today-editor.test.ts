@@ -128,6 +128,39 @@ describe('Today outline keys', () => {
     expect(resolveOutlineKey(key('ArrowDown'), base, 'mac')).toEqual({ type: 'focus-next' });
     expect(resolveOutlineKey(key('Escape'), base, 'mac')).toEqual({ type: 'block-select' });
   });
+
+  it("⌥→/⌥← zoom elsewhere, but on the Mac only from the node's end or start (word moves stay)", () => {
+    const alt = { altKey: true };
+    expect(resolveOutlineKey(key('ArrowRight', alt), { ...base, offset: 1 }, 'other')).toEqual({
+      type: 'zoom-in',
+    });
+    expect(resolveOutlineKey(key('ArrowRight', alt), { ...base, offset: 1 }, 'mac')).toBeNull();
+    expect(resolveOutlineKey(key('ArrowRight', alt), { ...base, offset: 3 }, 'mac')).toEqual({
+      type: 'zoom-in',
+    });
+    expect(resolveOutlineKey(key('ArrowLeft', alt), { ...base, offset: 0 }, 'mac')).toEqual({
+      type: 'zoom-out',
+    });
+    expect(resolveOutlineKey(key('ArrowLeft', alt), { ...base, offset: 2 }, 'mac')).toBeNull();
+  });
+
+  it('Mod+A leaves a partial text selection to the editor, then selects the node', () => {
+    const mod = { metaKey: true };
+    expect(resolveOutlineKey(key('a', mod), { ...base, offset: 1 }, 'mac')).toBeNull();
+    expect(
+      resolveOutlineKey(
+        key('a', mod),
+        { ...base, offset: 0, anchor: 0, focus: 3, hasSelection: true },
+        'mac'
+      )
+    ).toEqual({ type: 'select-from-text' });
+    expect(resolveOutlineKey(key('a', mod), { ...base, length: 0 }, 'mac')).toEqual({
+      type: 'select-from-text',
+    });
+    expect(
+      resolveOutlineKey(key('a', { ctrlKey: true }), { ...base, length: 0 }, 'mac')
+    ).toBeNull();
+  });
 });
 
 describe('Today LoroText binding', () => {
@@ -281,8 +314,8 @@ describe('Today session picker', () => {
       discrete: true,
     });
     expect(controller.getPicker()).toMatchObject({ query: 'fix', start: 4 });
-    controller.pickerItems = ['sess-1'];
-    controller.acceptPicker('sess-1');
+    controller.pickerItems = [{ kind: 'session', id: 'sess-1' }];
+    controller.acceptPicker({ kind: 'session', id: 'sess-1' });
     const [node] = store.getSnapshot().visible;
     expect(node).toMatchObject({
       text: `ask ${M} later`,
@@ -292,6 +325,132 @@ describe('Today session picker', () => {
     expect(store.getSnapshot().visible[0]).toMatchObject({ text: 'ask @fix later', mentions: [] });
     controller.dispose();
     root.remove();
+  });
+});
+
+describe('Today @ picker with people', () => {
+  it('lists people with avatars beside conversations, and a picked person becomes a chip that opens their Today', async () => {
+    (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
+    const { TodayEditorController } =
+      await import('../src/components/today/editor/today-editor-controller');
+    const { TodayEditorContext } =
+      await import('../src/components/today/editor/today-editor-context');
+    const { TodayMembersContext } = await import('../src/components/today/today-members');
+    const { TodaySessionPicker } = await import('../src/components/today/today-mention-picker');
+    const { parseTodayPasteText } = await import('@lody/shared');
+    const store = createTodayPageStore({
+      docId: 'today-u1-2026-11-17',
+      doc: new LoroDoc(),
+      registered: true,
+      join: async () => ({ room: { unsubscribe: () => {} }, synced: Promise.resolve() }),
+      register: async () => {},
+      setTimer: () => () => {},
+      retryDelayMs: () => 1000,
+    });
+    store.outline.paste({ kind: 'page-start' }, parseTodayPasteText('ask'));
+    const cache = {
+      peek: () => store,
+      acquire: async () => store,
+      releaseRef: () => {},
+    } as unknown as TodayPageStoreCache;
+    const controller = new TodayEditorController(cache);
+    const opened: string[] = [];
+    controller.onOpenMember = (userId) => opened.push(userId);
+    const members = new Map([
+      ['u1', { userId: 'u1', name: 'Me' }],
+      ['u2', { userId: 'u2', name: 'Alice Wong', image: 'https://example.invalid/a.png' }],
+      ['u3', { userId: 'u3', name: 'Bob' }],
+    ]);
+    const sessions = [
+      {
+        slug: 's',
+        sessionId: 'sess-al' as never,
+        title: 'Align the release',
+        activityAt: 1,
+        projectKey: 'chat' as const,
+      },
+    ];
+    const surface = document.createElement('div');
+    document.body.append(surface);
+    const root = createRoot(surface);
+    await act(async () =>
+      root.render(
+        withTestI18n(
+          createElement(
+            TodayEditorContext.Provider,
+            { value: controller },
+            createElement(
+              TodayMembersContext.Provider,
+              { value: members },
+              createElement(TodayDaySection, {
+                cache,
+                userId: 'u1',
+                date: '2026-11-17' as never,
+                today: '2026-11-17' as never,
+                isTop: true,
+                onEmptyChange: () => {},
+              }),
+              createElement(TodaySessionPicker, { items: sessions })
+            )
+          ),
+          createTestI18n()
+        )
+      )
+    );
+    const id = store.getSnapshot().visible[0]!.id;
+    await act(async () => controller.activate(store, id, 'end'));
+    await act(async () =>
+      controller.editor.update(
+        () => {
+          $setSelectionOffsets(3);
+          const selection = $getSelection();
+          if ($isRangeSelection(selection)) selection.insertText(' @al');
+        },
+        { discrete: true }
+      )
+    );
+    const options = () =>
+      [...surface.querySelectorAll<HTMLElement>('[role="option"]')].map((option) => [
+        option.dataset.todayPickerKind,
+        option.textContent,
+      ]);
+    expect(options()).toEqual([
+      ['member', 'AWAlice Wong'],
+      ['session', 'Align the release'],
+    ]);
+    const tab = (label: string) =>
+      [...surface.querySelectorAll<HTMLElement>('[role="tab"]')].find(
+        (t) => t.textContent === label
+      )!;
+    await act(async () => tab('Sessions').click());
+    expect(options()).toEqual([['session', 'Align the release']]);
+    await act(async () => tab('People').click());
+    expect(options()).toEqual([['member', 'AWAlice Wong']]);
+    const editable = surface.querySelector<HTMLElement>('[contenteditable="true"]')!;
+    await act(async () => {
+      window.getSelection()?.removeAllRanges();
+      editable.dispatchEvent(
+        new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true })
+      );
+      await Promise.resolve();
+    });
+    expect(store.getSnapshot().visible[0]).toMatchObject({
+      text: `ask ${M}`,
+      mentions: [{ start: 4, kind: 'member', id: 'u2' }],
+    });
+    await act(async () => controller.deactivate());
+    const chip = surface.querySelector<HTMLElement>('[data-today-member="u2"]')!;
+    expect(chip.textContent).toBe('AWAlice Wong');
+    await act(async () => chip.click());
+    expect(opened).toEqual(['u2']);
+    // A member who left the workspace keeps the chip, named as unknown.
+    members.delete('u2');
+    await act(async () => void store.outline.insertMention(id, 0, 0, { kind: 'member', id: 'u2' }));
+    expect(surface.querySelector('[data-today-member="u2"]')?.textContent).toBe('Unknown member');
+    act(() => root.unmount());
+    controller.dispose();
+    store.dispose();
+    surface.remove();
   });
 });
 
@@ -435,6 +594,65 @@ describe('Today outline keys read the live caret', () => {
     expect(store.getSnapshot().visible.map((node) => node.text)).toEqual(['onetwo']);
     controller.dispose();
     root.remove();
+  });
+
+  it('keeps text an IME was still composing when a click moves editing to another node', async () => {
+    const { createTodayPageStoreCache } = await import('../src/providers/today-page-store-cache');
+    const { TodayEditorController } =
+      await import('../src/components/today/editor/today-editor-controller');
+    const { getTodayDocId, parseTodayPasteText } = await import('@lody/shared');
+    const cache = createTodayPageStoreCache({
+      releaseDelayMs: 1000,
+      idleCap: 2,
+      setTimer: () => () => {},
+      retryDelayMs: () => 1000,
+      repo: {
+        openDoc: async () => ({ doc: new LoroDoc(), joinRoom: async () => null }),
+        isRegistered: async () => true,
+        upsertDocMeta: async () => {},
+        unloadDoc: async () => {},
+        observeDocs: () => ({ docIds: [], unsubscribe: () => {} }),
+      },
+    });
+    const store = await cache.acquire(getTodayDocId('me', '2026-11-19' as never));
+    store.outline.paste({ kind: 'page-start' }, parseTodayPasteText('one\ntwo'));
+    const [first, second] = store.getSnapshot().visible;
+    const controller = new TodayEditorController(cache);
+    const editable = () => {
+      const root = document.createElement('div');
+      root.contentEditable = 'true';
+      document.body.append(root);
+      return root;
+    };
+    const type = (value: string, compose: boolean) =>
+      controller.editor.update(
+        () => {
+          const selection = $getSelection();
+          if (!$isRangeSelection(selection)) throw new Error('no caret');
+          if (compose) $setCompositionKey(selection.anchor.key);
+          selection.insertText(value);
+        },
+        { discrete: true }
+      );
+    const rootA = editable();
+    controller.activate(store, first!.id, 'end');
+    controller.attachRoot(rootA);
+    // The preedit is on screen but not yet in the document.
+    type('你好', true);
+    expect(store.getSnapshot().visible[0]!.text).toBe('one');
+    // The click activates the other row: React unmounts this editable and mounts that one.
+    controller.activate(store, second!.id, 'end');
+    controller.attachRoot(null);
+    const rootB = editable();
+    controller.attachRoot(rootB);
+    type('!', false);
+    expect(store.getSnapshot().visible.map((node) => node.text)).toEqual(['one你好', 'two!']);
+    store.undo.undo();
+    store.undo.undo();
+    expect(store.getSnapshot().visible.map((node) => node.text)).toEqual(['one', 'two']);
+    controller.dispose();
+    rootA.remove();
+    rootB.remove();
   });
 
   it('Enter over a selected range replaces it with the line break', async () => {
@@ -850,6 +1068,331 @@ describe('Today day section opening', () => {
     act(() => root.unmount());
     container.remove();
     store.dispose();
+  });
+});
+
+describe('Today to-dos and the selection bar', () => {
+  async function render(lines: string) {
+    (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
+    const { TodayEditorController } =
+      await import('../src/components/today/editor/today-editor-controller');
+    const { TodayEditorContext } =
+      await import('../src/components/today/editor/today-editor-context');
+    const { TodaySelectionBar } = await import('../src/components/today/today-selection-bar');
+    const { parseTodayPasteText } = await import('@lody/shared');
+    const store = createTodayPageStore({
+      docId: 'today-u1-2026-11-18',
+      doc: new LoroDoc(),
+      registered: true,
+      join: async () => ({ room: { unsubscribe: () => {} }, synced: Promise.resolve() }),
+      register: async () => {},
+      setTimer: () => () => {},
+      retryDelayMs: () => 1000,
+    });
+    store.outline.paste({ kind: 'page-start' }, parseTodayPasteText(lines));
+    const cache = {
+      peek: () => store,
+      acquire: async () => store,
+      releaseRef: () => {},
+    } as unknown as TodayPageStoreCache;
+    const controller = new TodayEditorController(cache);
+    const surface = document.createElement('div');
+    surface.tabIndex = -1;
+    document.body.append(surface);
+    controller.attachSurface(surface);
+    const converted: string[] = [];
+    const root = createRoot(surface);
+    await act(async () =>
+      root.render(
+        withTestI18n(
+          createElement(
+            TodayEditorContext.Provider,
+            { value: controller },
+            createElement(TodayDaySection, {
+              cache,
+              userId: 'u1',
+              date: '2026-11-18' as never,
+              today: '2026-11-18' as never,
+              isTop: true,
+              onEmptyChange: () => {},
+            }),
+            createElement(TodaySelectionBar, {
+              onConvert: (_store: unknown, nodeId: string) => converted.push(nodeId),
+            })
+          ),
+          createTestI18n()
+        )
+      )
+    );
+    const rows = () => store.getSnapshot().visible.map((node) => [node.text, node.todo]);
+    const row = (index: number) =>
+      surface.querySelectorAll<HTMLElement>('[data-today-node]')[index]!;
+    const bar = () => surface.querySelector<HTMLElement>('[role="toolbar"]');
+    const barButton = (label: string) =>
+      [...(bar()?.querySelectorAll('button') ?? [])].find(
+        (button) => button.getAttribute('aria-label') === label || button.textContent === label
+      )!;
+    const click = (element: Element) =>
+      act(async () => {
+        element.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+      });
+    const done = () => {
+      act(() => root.unmount());
+      controller.dispose();
+      store.dispose();
+      surface.remove();
+    };
+    return { store, controller, surface, rows, row, bar, barButton, click, converted, done };
+  }
+
+  const pointer = (type: string, init: MouseEventInit = {}) => {
+    const event = new MouseEvent(type, { bubbles: true, cancelable: true, button: 0, ...init });
+    return event;
+  };
+
+  it('a bullet click selects the node and offers its actions; the bar turns it into a to-do, marks it done, and back', async () => {
+    const ctx = await render('write the spec\nb');
+    expect(ctx.bar()).toBeNull();
+    const bullet = ctx.row(0).querySelector('[data-today-bullet]')!;
+    await act(async () => {
+      bullet.dispatchEvent(pointer('pointerdown', { clientX: 5, clientY: 5 }));
+      window.dispatchEvent(pointer('pointerup', { clientX: 5, clientY: 5 }));
+    });
+    expect(ctx.row(0).getAttribute('aria-selected')).toBe('true');
+    expect(ctx.bar()).not.toBeNull();
+    await ctx.click(ctx.barButton('Turn into to-do'));
+    expect(ctx.rows()[0]).toEqual(['write the spec', 'todo']);
+    expect(ctx.row(0).querySelector('[role="checkbox"]')?.getAttribute('aria-checked')).toBe(
+      'false'
+    );
+    await ctx.click(ctx.barButton('Mark as done'));
+    await ctx.click(ctx.barButton('Back to plain text'));
+    expect(ctx.rows()[0]).toEqual(['write the spec', undefined]);
+    expect(ctx.row(0).querySelector('[role="checkbox"]')).toBeNull();
+    await ctx.click(ctx.barButton('Convert to task'));
+    expect(ctx.converted).toEqual([ctx.store.getSnapshot().visible[0]!.id]);
+    await ctx.click(ctx.barButton('Delete'));
+    expect(ctx.rows()).toEqual([['b', undefined]]);
+    expect(ctx.bar()).toBeNull();
+    ctx.done();
+  });
+
+  it('waits for a drag-selection to be released, then acts on every selected row', async () => {
+    const ctx = await render('a\n- [ ] b\nc');
+    const ids = ctx.store.getSnapshot().visible.map((node) => node.id);
+    const text = ctx.row(0).lastElementChild as HTMLElement;
+    await act(async () => {
+      ctx.controller.pointerDown(ctx.store, ids[0]!, text, {
+        clientX: 0,
+        clientY: 0,
+        shiftKey: false,
+      });
+      ctx.controller.selectBlocks(ctx.store, [ids[0]!, ids[1]!]);
+    });
+    expect(ctx.bar()).toBeNull();
+    await act(async () => {
+      window.dispatchEvent(pointer('pointerup'));
+    });
+    expect(ctx.bar()).not.toBeNull();
+    expect(ctx.barButton('Convert to task').disabled).toBe(true);
+    const mod = navigator.platform.includes('Mac') ? { metaKey: true } : { ctrlKey: true };
+    await act(async () => {
+      ctx.controller.onBlockKey(new KeyboardEvent('keydown', { key: 'Enter', ...mod }));
+    });
+    expect(ctx.rows()).toEqual([
+      ['a', 'todo'],
+      ['b', 'done'],
+      ['c', undefined],
+    ]);
+    ctx.done();
+  });
+
+  it('the checkbox swaps to-do and done, and an empty line hides its dot until edited', async () => {
+    const ctx = await render('- [ ] a');
+    await ctx.click(ctx.row(0).querySelector('[role="checkbox"]')!);
+    expect(ctx.rows()).toEqual([['a', 'done']]);
+    await ctx.click(ctx.row(0).querySelector('[role="checkbox"]')!);
+    expect(ctx.rows()).toEqual([['a', 'todo']]);
+    const id = ctx.store.getSnapshot().visible[0]!.id;
+    await act(async () => void ctx.store.outline.split(id, 1));
+    const empty = ctx.store.getSnapshot().visible[1]!.id;
+    const quiet = () => ctx.row(1).querySelector('[data-today-dot="quiet"]');
+    expect(quiet()).toBeNull();
+    await act(async () => void ctx.store.outline.enterOnEmpty(empty));
+    expect(quiet()).not.toBeNull();
+    await act(async () => ctx.controller.activate(ctx.store, empty, 'end'));
+    expect(quiet()).toBeNull();
+    ctx.done();
+  });
+
+  it('Mod+Enter while editing cycles the node, which stays in editing', async () => {
+    const ctx = await render('abc');
+    const id = ctx.store.getSnapshot().visible[0]!.id;
+    await act(async () => ctx.controller.activate(ctx.store, id, 1));
+    const editable = ctx.row(0).querySelector<HTMLElement>('[contenteditable]')!;
+    const mod = navigator.platform.includes('Mac') ? { metaKey: true } : { ctrlKey: true };
+    const press = () =>
+      act(async () => {
+        window.getSelection()?.removeAllRanges();
+        editable.dispatchEvent(
+          new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true, ...mod })
+        );
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+    await press();
+    expect(ctx.rows()).toEqual([['abc', 'todo']]);
+    await press();
+    expect(ctx.rows()).toEqual([['abc', 'done']]);
+    expect(ctx.controller.isActive(ctx.store, id)).toBe(true);
+    await press();
+    expect(ctx.rows()).toEqual([['abc', undefined]]);
+    ctx.done();
+  });
+});
+
+describe('Today focus view', () => {
+  async function zoomed(lines: string, rootText: string | null) {
+    (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
+    const { TodayEditorController } =
+      await import('../src/components/today/editor/today-editor-controller');
+    const { TodayEditorContext } =
+      await import('../src/components/today/editor/today-editor-context');
+    const { parseTodayPasteText } = await import('@lody/shared');
+    const store = createTodayPageStore({
+      docId: 'today-u1-2026-11-16',
+      doc: new LoroDoc(),
+      registered: true,
+      join: async () => ({ room: { unsubscribe: () => {} }, synced: Promise.resolve() }),
+      register: async () => {},
+      setTimer: () => () => {},
+      retryDelayMs: () => 1000,
+    });
+    store.outline.paste({ kind: 'page-start' }, parseTodayPasteText(lines));
+    const id = (text: string) => store.outline.getAllNodes().find((n) => n.text === text)!.id;
+    const cache = {
+      peek: () => store,
+      acquire: async () => store,
+      releaseRef: () => {},
+    } as unknown as TodayPageStoreCache;
+    const controller = new TodayEditorController(cache);
+    const events: string[] = [];
+    controller.onZoom = (_store, nodeId) => events.push(`zoom:${nodeId}`);
+    controller.onZoomOut = () => events.push('out');
+    controller.onNodeMenu = (_store, nodeId) => events.push(`menu:${nodeId}`);
+    const root = rootText ? id(rootText) : null;
+    controller.setFocus({ date: '2026-11-16' as never, rootId: root });
+    const surface = document.createElement('div');
+    surface.tabIndex = -1;
+    document.body.append(surface);
+    controller.attachSurface(surface);
+    const reactRoot = createRoot(surface);
+    await act(async () =>
+      reactRoot.render(
+        withTestI18n(
+          createElement(
+            TodayEditorContext.Provider,
+            { value: controller },
+            createElement(TodayDaySection, {
+              cache,
+              userId: 'u1',
+              date: '2026-11-16' as never,
+              today: '2026-11-16' as never,
+              isTop: true,
+              onEmptyChange: () => {},
+              zoomRoot: root,
+            })
+          ),
+          createTestI18n()
+        )
+      )
+    );
+    const rows = () =>
+      [...surface.querySelectorAll<HTMLElement>('[data-today-node]')].map((row) =>
+        row.textContent?.replaceAll('\u200b', '')
+      );
+    const mod = navigator.platform.includes('Mac') ? { metaKey: true } : { ctrlKey: true };
+    const pressIn = async (key: string, init: KeyboardEventInit = {}) =>
+      act(async () => {
+        window.getSelection()?.removeAllRanges();
+        surface
+          .querySelector<HTMLElement>('[contenteditable="true"]')!
+          .dispatchEvent(
+            new KeyboardEvent('keydown', { key, bubbles: true, cancelable: true, ...init })
+          );
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+    const done = () => {
+      act(() => reactRoot.unmount());
+      controller.dispose();
+      store.dispose();
+      surface.remove();
+    };
+    return { store, controller, surface, id, root, rows, events, mod, pressIn, done };
+  }
+
+  it('a bullet click zooms in and "⋯" opens the node menu', async () => {
+    const ctx = await zoomed('a\n  b', null);
+    const row = ctx.surface.querySelectorAll<HTMLElement>('[data-today-node]')[1]!;
+    await act(async () => {
+      row
+        .querySelector('[data-today-bullet]')!
+        .dispatchEvent(
+          new MouseEvent('pointerdown', { bubbles: true, button: 0, clientX: 5, clientY: 5 })
+        );
+      window.dispatchEvent(new MouseEvent('pointerup', { bubbles: true, clientX: 5, clientY: 5 }));
+    });
+    await act(async () => row.querySelector<HTMLElement>('[data-today-more]')!.click());
+    expect(ctx.events).toEqual([`zoom:${ctx.id('b')}`, `menu:${ctx.id('b')}`]);
+    ctx.done();
+  });
+
+  it('shows the zoomed node as the title over its subtree and keeps keys inside it', async () => {
+    const ctx = await zoomed('a\n  b\n    c\n  d\ne', 'b');
+    expect(ctx.rows()).toEqual(['b', 'c']);
+    await act(async () => ctx.controller.activate(ctx.store, ctx.id('b'), 1));
+    await ctx.pressIn('Enter');
+    expect(ctx.rows()).toEqual(['b', '', 'c']);
+    await act(async () => ctx.controller.activate(ctx.store, ctx.id('b'), 0));
+    await ctx.pressIn('Enter');
+    expect(ctx.rows()).toEqual(['b', '', '', 'c']);
+    expect(ctx.store.outline.getNode(ctx.id('b'))?.parentId).toBe(ctx.id('a'));
+    await act(async () => ctx.controller.activate(ctx.store, ctx.id('c'), 'end'));
+    await ctx.pressIn('Tab', { shiftKey: true });
+    expect(ctx.store.outline.getNode(ctx.id('c'))?.parentId).toBe(ctx.id('b'));
+    await act(async () => ctx.controller.activate(ctx.store, ctx.id('b'), 0));
+    await ctx.pressIn('ArrowUp');
+    expect(ctx.controller.isActive(ctx.store, ctx.id('b'))).toBe(true);
+    await ctx.pressIn('Backspace');
+    expect(ctx.store.outline.getNode(ctx.id('b'))?.text).toBe('b');
+    await act(async () => ctx.controller.selectBlocks(ctx.store, [ctx.id('c')]));
+    const block = (key: string, init: KeyboardEventInit) =>
+      act(
+        async () => void ctx.controller.onBlockKey(new KeyboardEvent('keydown', { key, ...init }))
+      );
+    await block('a', ctx.mod);
+    expect(ctx.controller.getBlockSelection()?.ids).toEqual([ctx.id('b')]);
+    await block('a', ctx.mod);
+    expect(ctx.controller.getBlockSelection()?.ids).toEqual([ctx.id('b')]);
+    await block('Backspace', {});
+    expect(ctx.store.outline.getNode(ctx.id('b'))).toBeDefined();
+    await block('ArrowLeft', { altKey: true });
+    expect(ctx.events).toEqual(['out']);
+    ctx.done();
+  });
+
+  it('says the zoomed node is gone when a peer deletes it, and offers the way back', async () => {
+    const ctx = await zoomed('a\n  b', 'b');
+    await act(async () => void ctx.store.outline.deleteNodes([ctx.id('b')]));
+    expect(ctx.surface.textContent).toContain('This node was deleted.');
+    await act(async () =>
+      [...ctx.surface.querySelectorAll('button')]
+        .find((b) => b.textContent === 'Back to the parent')!
+        .click()
+    );
+    expect(ctx.events).toEqual(['out']);
+    ctx.done();
   });
 });
 

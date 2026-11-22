@@ -22,7 +22,11 @@ import { isWorkspaceMcpServerMeta, type WorkspaceMcpServerMeta } from './workspa
 import { LocalFileResolutionSchema } from './local-file-preview';
 import { MachinePiExtensionsResponseSchema } from './pi-extensions';
 import { z } from 'zod';
-import { SessionHistoryReadQuerySchema, SessionHistoryReadResponseSchema } from './message-schemas';
+import {
+  LocalProjectBranchListResultSchema,
+  SessionHistoryReadQuerySchema,
+  SessionHistoryReadResponseSchema,
+} from './message-schemas';
 import { RpcSecretEnvelopeSchema, RpcSecretPublicKeySchema } from './rpc-secret';
 import { McpAuthenticationResultSchema, McpLocalAuthenticationSchema } from './mcp-authentication';
 import { SESSION_GOAL_ACTIONS } from './goal';
@@ -178,6 +182,13 @@ export const SorbetCustomProviderInputSchema = z
     models: z.array(SorbetCustomProviderModelSchema).max(SORBET_CUSTOM_PROVIDER_MODELS_MAX_COUNT),
   })
   .strict();
+/**
+ * What the user can change on a stored endpoint. Models stay Sorbet's: the
+ * machine keeps the discovered list and any curated fields it holds.
+ */
+export const SorbetCustomProviderEditSchema = SorbetCustomProviderInputSchema.omit({
+  models: true,
+}).strict();
 export const SorbetCustomProviderSchema = SorbetCustomProviderInputSchema.extend({
   id: SorbetProviderIdSchema,
 }).strict();
@@ -201,6 +212,9 @@ export const SorbetProvidersResultSchema = z.discriminatedUnion('type', [
   z
     .object({ type: z.literal('sorbet/providers-create'), provider: SorbetCustomProviderSchema })
     .strict(),
+  z
+    .object({ type: z.literal('sorbet/providers-update'), provider: SorbetCustomProviderSchema })
+    .strict(),
   z.object({ type: z.literal('sorbet/providers-delete') }).strict(),
   z.object({ type: z.literal('sorbet/providers-refresh') }).strict(),
   z
@@ -212,6 +226,7 @@ export const SorbetProvidersResultSchema = z.discriminatedUnion('type', [
 ]);
 
 export type SorbetCustomProviderInput = z.infer<typeof SorbetCustomProviderInputSchema>;
+export type SorbetCustomProviderEdit = z.infer<typeof SorbetCustomProviderEditSchema>;
 export type SorbetCustomProvider = z.infer<typeof SorbetCustomProviderSchema>;
 export type SorbetProvidersResult = z.infer<typeof SorbetProvidersResultSchema>;
 
@@ -303,6 +318,16 @@ export const LocalMachineRpcRequestSchema = z.discriminatedUnion('method', [
       .strict(),
   }).strict(),
   BaseLocalMachineRpcRequestSchema.extend({
+    method: z.literal('sorbet/providers-update'),
+    params: z
+      .object({
+        configId: AgentConfigIdSchema,
+        providerId: SorbetProviderIdSchema,
+        provider: SorbetCustomProviderEditSchema,
+      })
+      .strict(),
+  }).strict(),
+  BaseLocalMachineRpcRequestSchema.extend({
     method: z.literal('sorbet/providers-delete'),
     params: z
       .object({ configId: AgentConfigIdSchema, providerId: SorbetProviderIdSchema })
@@ -349,6 +374,18 @@ export const LocalMachineRpcRequestSchema = z.discriminatedUnion('method', [
   BaseLocalMachineRpcRequestSchema.extend({
     method: z.literal('project/probe-local-member'),
     params: z.object({ localProjectId: z.string().trim().min(1) }).strict(),
+  }).strict(),
+  BaseLocalMachineRpcRequestSchema.extend({
+    method: z.literal('local-project/list-branches'),
+    params: z
+      .object({
+        localProjectId: z.string().trim().min(1),
+        requestedByUserId: z.string().trim().min(1),
+        query: z.string().max(256).optional(),
+        limit: z.number().int().min(1).max(200).optional(),
+        cursor: z.string().trim().min(1).max(512).optional(),
+      })
+      .strict(),
   }).strict(),
   BaseLocalMachineRpcRequestSchema.extend({
     method: z.literal('ios-simulator/agent-control'),
@@ -623,6 +660,35 @@ export const ProjectProbeLocalMemberResultSchema = ProjectLocalMemberProbeSchema
 
 export type ProjectProbeLocalMemberResult = z.infer<typeof ProjectProbeLocalMemberResultSchema>;
 
+export const LocalProjectListBranchesRpcResponseSchema = z.discriminatedUnion('success', [
+  z
+    .object({
+      type: z.literal('local-project/list-branches_response'),
+      machineId: z.string().trim().min(1),
+      workspaceId: z.string().trim().min(1),
+      localProjectId: z.string().trim().min(1),
+      success: z.literal(true),
+      result: LocalProjectBranchListResultSchema,
+      observedAtMs: z.number().nonnegative(),
+    })
+    .strict(),
+  z
+    .object({
+      type: z.literal('local-project/list-branches_response'),
+      machineId: z.string().trim().min(1),
+      workspaceId: z.string().trim().min(1),
+      localProjectId: z.string().trim().min(1),
+      success: z.literal(false),
+      error: z.string().trim().min(1),
+      message: z.string().trim().min(1).optional(),
+    })
+    .strict(),
+]);
+
+export type LocalProjectListBranchesRpcResponse = z.infer<
+  typeof LocalProjectListBranchesRpcResponseSchema
+>;
+
 const SessionLiveStateSchema = z.enum(['idle', 'initializing', 'running', 'waiting', 'unknown']);
 
 /**
@@ -697,6 +763,7 @@ export const LocalMachineRpcResultSchema = z.union([
   SessionLiveStatusResponseSchema,
   FileDownloadResponseSchema,
   ProjectProbeLocalMemberResultSchema,
+  LocalProjectListBranchesRpcResponseSchema,
   MemoryProviderResponseSchema,
   IosSimulatorResponseSchema,
   AndroidEmulatorResponseSchema,

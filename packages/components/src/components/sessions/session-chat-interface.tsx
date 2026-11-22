@@ -6,10 +6,12 @@ import { usePlaintextCopy } from '@/hooks/use-plaintext-copy';
 import { useHorizontalFoldLayout } from '../mobile/use-horizontal-fold-layout';
 import { WorkspaceFeatureReasonText } from '@/components/workspace-feature-notice';
 import {
+  useLegacyWorkspaceQueryStatus,
   useWorkspaceFeature,
   useWorkspaceFeatureReason,
   useMachineRpcFeatureReason,
 } from '@/hooks/use-workspace-feature';
+import { resolveLinkedWorkspaceGitHubRepo } from '@/lib/session-repo';
 import { useIosSimulatorPreviewRequest } from './ios-simulator/use-ios-simulator-preview-request';
 import { useLocalSessionContinuation } from './use-local-session-continuation';
 import { SessionContinuationNote } from './session-continuation-note';
@@ -95,8 +97,9 @@ import {
   Users,
   X,
 } from 'lucide-react';
-import { buildSnoozePresets, statusViewTier } from '@lody/shared';
+import { buildSnoozePresets, expiredSnoozeTimestamp, statusViewTier } from '@lody/shared';
 import { useStatusViewWritable } from '@/hooks/use-status-view-writable';
+import { useOrganization } from '@/hooks/useOrganization';
 import { CustomSnoozeDialog, type CustomSnoozeDialogTarget } from '../sidebar-status-snooze-dialog';
 import { useRouter } from '@tanstack/react-router';
 import { Spinner } from '@lody/ui/spinner';
@@ -216,7 +219,12 @@ import {
   resolveSessionConversationPreparationState,
   type SessionConversationPreparationState,
 } from '@/lib/session-conversation-preparation';
-import { useAtomValue, useSetAtom } from 'jotai';
+import { useAtomValue, useSetAtom, useStore } from 'jotai';
+import {
+  clearSessionPrMergeStatus,
+  sessionPrMergeStatusAtomFamily,
+} from '@/atoms/session-pr-merge-status';
+import { isGitHubOperationTokenConnectionLostError } from '@/lib/github-token';
 import { cloudOperations } from '@/lib/cloud-api-operations';
 import { useCloudQuery, usePlatformCapability } from '@lody/platform/react';
 import { openExternalUrl } from '@/lib/native-browser';
@@ -281,6 +289,7 @@ import { getSessionRunConfigDraftTargetKey } from '@/atoms/session-run-config-dr
 import { sessionProjectMemberSelectionAtomFamily } from '@/atoms/session-project-member-selection';
 import { useSessionActions } from '@/hooks/use-session-actions';
 import { useWorkspaceMembers } from '@/hooks/use-workspace-members';
+import { useWorkspaceSenderProfile } from '@/hooks/use-workspace-sender-profile';
 import { RenameSessionDialog, type RenameSessionDialogTarget } from './rename-session-dialog';
 import {
   unlinkSessionPullRequestFromUi,
@@ -786,6 +795,10 @@ const styles = stylex.create({
   composerContents: { display: 'contents' },
   composerHidden: { display: 'none' },
 });
+
+function reportStatusActionError(error: unknown): void {
+  toast.error(error instanceof Error ? error.message : String(error));
+}
 
 function getErrorMessage(err: unknown): string {
   const syncError = loroSyncErrorTools?.formatLoroSyncError(err);
@@ -1430,7 +1443,7 @@ export function SessionHeaderMenu({
   const [customSnoozeTarget, setCustomSnoozeTarget] = useState<CustomSnoozeDialogTarget | null>(
     null
   );
-  const statusNow = new Date();
+  const statusNow = new Date(getServerNow());
   const statusGroup = statusViewTier(
     {
       activityAt: session.lastMessageAt ?? (Date.parse(session.createdAt ?? '') || 0),
@@ -1784,7 +1797,7 @@ export function SessionHeaderMenu({
                           preset.id === 'oneHour'
                             ? t('sessions.contextMenu.snoozeOneHour', 'In 1 hour')
                             : preset.id === 'laterToday'
-                              ? t('sessions.contextMenu.snoozeLaterToday', 'Later today')
+                              ? t('sessions.contextMenu.snoozeLaterToday', 'In 3 hours')
                               : preset.id === 'tomorrowMorning'
                                 ? t(
                                     'sessions.contextMenu.snoozeTomorrowMorning',
@@ -2226,6 +2239,8 @@ export interface SessionChatInterfaceProps {
   onFilePathClick?: (filePath: string) => void;
   /** Opens an agent-uploaded HTML source path directly in rendered file preview. */
   onOpenHtmlFile?: (filePath: string) => void;
+  /** Opens an attachment preview as a side-panel tab; false when there is no panel. */
+  onOpenFileAttachment?: (file: SessionFilePayload, sessionId: SessionId) => boolean;
   messageFileDiffEntriesByTurn?: MessageFileDiffEntriesByTurn;
   /** Optional replacement for the GitHub badge area in the header. */
   headerActionsSlot?: React.ReactNode;
@@ -2458,6 +2473,7 @@ export const SessionChatInterface = memo(
       onFileDiffClick,
       onFilePathClick,
       onOpenHtmlFile,
+      onOpenFileAttachment,
       messageFileDiffEntriesByTurn,
       headerActionsSlot,
       headerEndSlot,
@@ -2993,17 +3009,34 @@ export const SessionChatInterface = memo(
     const [resolvingConflictsSessionId, setResolvingConflictsSessionId] =
       useState<SessionId | null>(null);
     const isResolvingConflicts = resolvingConflictsSessionId === session.id;
+    const legacyQueryStatus = useLegacyWorkspaceQueryStatus(workspaceId);
     const repositories = useLegacyWorkspaceQuery(
       cloudOperations.github.getWorkspaceRepositories,
       workspaceId ? { workspaceId } : 'skip'
     );
-    const isRepoPublic = useMemo(() => {
-      if (!repoFullName || !repositories) return undefined;
-      const repo = repositories.find((r) => r.fullName === repoFullName);
-      return repo ? !repo.private : undefined;
-    }, [repoFullName, repositories]);
+    const linkedRepo = useMemo(
+      () => resolveLinkedWorkspaceGitHubRepo(repoFullName, repositories),
+      [repoFullName, repositories]
+    );
+    const isRepoPublic = linkedRepo?.isPublic;
+    const isRepoLinked = useMemo(() => {
+      if (!repoFullName || !hasHostedGitHub || legacyQueryStatus === 'blocked') return false;
+      if (session.project?.kind === 'local') return Boolean(linkedRepo);
+      if (repositories !== undefined) return Boolean(linkedRepo);
+      return undefined;
+    }, [
+      hasHostedGitHub,
+      legacyQueryStatus,
+      linkedRepo,
+      repoFullName,
+      repositories,
+      session.project?.kind,
+    ]);
 
-    const { knownItems: knownIssuePrItems } = useKnownIssuePrItems(repoFullName, isRepoPublic);
+    const { knownItems: knownIssuePrItems } = useKnownIssuePrItems(
+      isRepoLinked === false ? undefined : (linkedRepo?.fullName ?? repoFullName),
+      isRepoPublic
+    );
 
     type InputActionState = 'ready' | 'dispatching';
     const [inputActionState, setInputActionState] = useState<InputActionState>('ready');
@@ -3045,6 +3078,7 @@ export const SessionChatInterface = memo(
               session,
               sessionLocalProjectRootPath: resolvedLocalProjectMeta?.rootPath ?? null,
               isRepoPublic,
+              isRepoLinked,
             },
         availableCommands,
         skillAgent: editSkillAgent,
@@ -3053,6 +3087,7 @@ export const SessionChatInterface = memo(
         availableCommands,
         editSkillAgent,
         isArchivedSession,
+        isRepoLinked,
         isRepoPublic,
         resolvedLocalProjectMeta?.rootPath,
         session,
@@ -3101,7 +3136,7 @@ export const SessionChatInterface = memo(
       settleSession,
       moveSessionToFocus,
     } = useSessionActions();
-    const statusViewWritable = useStatusViewWritable();
+    const statusViewWritable = useStatusViewWritable(useOrganization().role);
     // Linked pull requests: the user unlinks through their own records (the reconciler
     // alone publishes `pullRequests`). Rows open the primary PR's tab, others on GitHub.
     const prOwnerMeta = workspaceSession ?? session;
@@ -4364,15 +4399,26 @@ export const SessionChatInterface = memo(
       }
 
       const liveEngagement = getLatestWindowReadEngagement();
+      const readGate = {
+        rendersConversation: !hideMessageArea,
+        isVisible: surfaceVisible,
+        isWindowActive: isWindowReadActive && liveEngagement.isWindowActive,
+        hasPageInteraction: hasWindowReadInteraction && liveEngagement.hasPageInteraction,
+      };
+      const rootWokeAt =
+        session.parentSessionId && workspaceSession
+          ? expiredSnoozeTimestamp(parseTimestamp(workspaceSession.snoozedUntil), getServerNow())
+          : null;
       if (
-        !shouldMarkSessionRead({
-          rendersConversation: !hideMessageArea,
-          isVisible: surfaceVisible,
-          isWindowActive: isWindowReadActive && liveEngagement.isWindowActive,
-          hasPageInteraction: hasWindowReadInteraction && liveEngagement.hasPageInteraction,
-          lastMessageAt,
-          lastReadAt,
-        })
+        !shouldMarkSessionRead({ ...readGate, lastMessageAt, lastReadAt }) &&
+        !(
+          rootWokeAt !== null &&
+          shouldMarkSessionRead({
+            ...readGate,
+            lastMessageAt: rootWokeAt,
+            lastReadAt: parseTimestamp(workspaceSession?.lastReadAt),
+          })
+        )
       ) {
         return;
       }
@@ -4390,8 +4436,10 @@ export const SessionChatInterface = memo(
       session.id,
       session.lastMessageAt,
       session.lastReadAt,
+      session.parentSessionId,
       session.snoozedUntil,
       windowReadEngagementRevision,
+      workspaceSession,
     ]);
 
     const isDispatching = inputActionState === 'dispatching';
@@ -4535,16 +4583,19 @@ export const SessionChatInterface = memo(
       workspaceId,
     ]);
     const isFinalizing = isSessionFinalizing(liveSessionStatus);
-    // Resolve the same sender as the formal user row before owner confirmation.
-    const pendingSender = useCloudQuery(
-      cloudOperations.auth.getUserById,
-      currentUser?.id && workspaceId ? { userId: currentUser.id, workspaceId } : 'skip'
-    );
+    const pendingSenderUserId =
+      (runtime?.contentMode === 'e2ee' ? runtime.accountId : null) ?? currentUser?.id ?? null;
+    const pendingSender = useWorkspaceSenderProfile({
+      userId: pendingSenderUserId,
+      workspaceId,
+    });
     const pendingMessages = useSessionPendingMessages({
       sessionId: session.id,
       history: conversationView,
       user: pendingSender,
+      showSenderIdentity: isMultiMember,
       conversationFontSize,
+      onNavigateSession,
     });
     // Presence owns liveness; the same pending queue as the composer supplies
     // the kind of human input. Core metadata works for every ACP provider.
@@ -5669,16 +5720,41 @@ export const SessionChatInterface = memo(
       workspaceDirty,
     ]);
 
-    const effectivePrStatus = latestPr?.status ?? null;
+    const jotaiStore = useStore();
+    const prMergeStatus = useAtomValue(sessionPrMergeStatusAtomFamily(prSessionId ?? ''));
+    const effectivePrStatus =
+      latestPr?.status === 'merged'
+        ? 'merged'
+        : prMergeStatus?.phase === 'merged' &&
+            (!prMergeStatus.prNumber || prMergeStatus.prNumber === latestPrNumber)
+          ? 'merged'
+          : (latestPr?.status ?? null);
+
+    useEffect(() => {
+      if (prSessionId) {
+        clearSessionPrMergeStatus(jotaiStore, prSessionId, 'failed');
+      }
+    }, [jotaiStore, prSessionId]);
+
+    useEffect(() => {
+      if (prSessionId && latestPr?.status === 'merged') {
+        clearSessionPrMergeStatus(jotaiStore, prSessionId, 'merged');
+      }
+    }, [jotaiStore, latestPr?.status, prSessionId]);
+
     const { awaiting: awaitedPrStatus, awaitStatus: awaitPrStatus } = useAwaitedPrStatus(
       latestPr?.url ?? null,
       effectivePrStatus
     );
-    const isMergeSettling = isActivePrMerging || !!awaitedPrStatus?.includes('merged');
+    const isMergeSettling =
+      isActivePrMerging ||
+      prMergeStatus?.phase === 'merging' ||
+      !!awaitedPrStatus?.includes('merged');
     const isReadySettling = isActivePrMarkingReady || !!awaitedPrStatus?.includes('open');
 
     const handleMergePullRequest = useCallback(
       async (method: GitHubMergeMethod) => {
+        const targetPrNumber = latestPrNumber;
         captureSessionEvent('session/quick_action_selected', {
           action_id: 'merge',
           merge_method: method,
@@ -5688,12 +5764,27 @@ export const SessionChatInterface = memo(
         try {
           if (await mergeActivePullRequest(method)) awaitPrStatus(['merged']);
         } catch (error) {
-          toast.error(t('sessions.prTab.mergeError', 'Failed to merge'), {
-            description: getErrorMessage(error),
-          });
+          if (isGitHubOperationTokenConnectionLostError(error)) return;
+          toast.error(
+            targetPrNumber
+              ? t('sessions.prMergeStatus.failedNumber', 'Failed to merge PR #{{number}}', {
+                  number: targetPrNumber,
+                })
+              : t('sessions.prTab.mergeError', 'Failed to merge'),
+            {
+              description: getErrorMessage(error),
+            }
+          );
         }
       },
-      [awaitPrStatus, captureSessionEvent, mergeActivePullRequest, t, workspaceDirty]
+      [
+        awaitPrStatus,
+        captureSessionEvent,
+        latestPrNumber,
+        mergeActivePullRequest,
+        t,
+        workspaceDirty,
+      ]
     );
 
     const handleMarkReadyForReview = useCallback(async () => {
@@ -7299,17 +7390,28 @@ export const SessionChatInterface = memo(
         onSnooze={
           statusViewWritable && headerSharing?.access !== 'read'
             ? (snoozedUntil) =>
-                snoozeSessionWithConfirmation(session.id, snoozedUntil).then(() => undefined)
+                snoozeSessionWithConfirmation(session.id, snoozedUntil).then(
+                  () => undefined,
+                  reportStatusActionError
+                )
             : undefined
         }
         onSettle={
           statusViewWritable && headerSharing?.access !== 'read'
-            ? () => settleSessionWithConfirmation(session.id).then(() => undefined)
+            ? () =>
+                settleSessionWithConfirmation(session.id).then(
+                  () => undefined,
+                  reportStatusActionError
+                )
             : undefined
         }
         onMoveToFocus={
           statusViewWritable && headerSharing?.access !== 'read'
-            ? () => moveToFocusWithConfirmation(session.id).then(() => undefined)
+            ? () =>
+                moveToFocusWithConfirmation(session.id).then(
+                  () => undefined,
+                  reportStatusActionError
+                )
             : undefined
         }
         owner={ownerMenuState}
@@ -7640,6 +7742,7 @@ export const SessionChatInterface = memo(
                                 onFileDiffClick={onFileDiffClick}
                                 onFilePathClick={onFilePathClick ? handleFilePathClick : undefined}
                                 onOpenHtmlFile={handleOpenHtmlAttachment}
+                                onOpenFileAttachment={onOpenFileAttachment}
                                 onAnnotateImage={
                                   isArchivedSession ? undefined : handleAnnotateImage
                                 }
@@ -7934,6 +8037,7 @@ export const SessionChatInterface = memo(
                             }
                             ref={inputAreaRef}
                             session={session}
+                            messageHistory={conversationView}
                             sessionLocalProjectRootPath={resolvedLocalProjectMeta?.rootPath ?? null}
                             isMachineRemoved={isMachineRemoved}
                             isAgentBusy={isAgentBusy}
@@ -7963,6 +8067,7 @@ export const SessionChatInterface = memo(
                             configOptionSelectors={configOptionSelectors}
                             configOptionValues={configOptionValues}
                             isRepoPublic={isRepoPublic}
+                            isRepoLinked={isRepoLinked}
                             availableCommands={availableCommands}
                             commandsEnabled={isVisible}
                             freeTurnLimitNotice={freeSessionTurnNotice}
