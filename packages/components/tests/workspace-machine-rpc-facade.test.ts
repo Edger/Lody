@@ -28,7 +28,7 @@ afterEach(() => {
 });
 
 describe('createWorkspaceMachineRpcFacade', () => {
-  it('negotiates blob persistence while retaining writer-only encrypted diff authority', async () => {
+  it('negotiates blob persistence and read-classified encrypted diff calls', async () => {
     for (const [plane, protectedContent, supported, persist] of [
       ['local', false, true, false],
       ['cloud', false, true, true],
@@ -68,35 +68,23 @@ describe('createWorkspaceMachineRpcFacade', () => {
         scope: workspaceId,
       });
       if (protectedContent) {
-        expect(
-          await facade.requestCodeCollabOpenDiffManifest(remoteMachineId, {
-            sessionId,
-            path: 'a.ts',
-          })
-        ).toMatchObject({ status: 'error', code: 'permission_denied' });
-        expect(
-          await facade.requestCodeCollabReadBlob(remoteMachineId, {
-            sessionId,
-            key: `sha256:${'1'.repeat(64)}`,
-            offset: 0,
-            length: 100,
-          })
-        ).toMatchObject({ status: 'error', code: 'permission_denied' });
-        role = 'write';
-        expect(
-          await facade.requestCodeCollabOpenDiffManifest(
-            remoteMachineId,
-            { sessionId, path: 'a.ts' },
-            { ownerSessionId: 'parent' }
-          )
-        ).toEqual({ status: 'ok', entries: [], nextCursor: null });
-        expect(
-          await facade.requestCodeCollabReadBlob(
-            remoteMachineId,
-            { sessionId, key: `sha256:${'1'.repeat(64)}`, offset: 0, length: 100 },
-            { ownerSessionId: 'parent' }
-          )
-        ).toMatchObject({ offset: 0, length: 0, totalBytes: 0 });
+        for (const access of ['read', 'write'] as const) {
+          role = access;
+          expect(
+            await facade.requestCodeCollabOpenDiffManifest(
+              remoteMachineId,
+              { sessionId, path: 'a.ts' },
+              { ownerSessionId: 'parent' }
+            )
+          ).toEqual({ status: 'ok', entries: [], nextCursor: null });
+          expect(
+            await facade.requestCodeCollabReadBlob(
+              remoteMachineId,
+              { sessionId, key: `sha256:${'1'.repeat(64)}`, offset: 0, length: 100 },
+              { ownerSessionId: 'parent' }
+            )
+          ).toMatchObject({ offset: 0, length: 0, totalBytes: 0 });
+        }
       }
     }
   });
@@ -1568,6 +1556,56 @@ describe('encrypted file and preview routing', () => {
     expect(unsigned).toEqual([]);
   });
 
+  it('refuses an encrypted steer before sending when no encrypted channel exists', async () => {
+    const steer = {
+      sessionId,
+      expectedTurnId: 'assistant-1',
+      userTurnId: 'user-2',
+      userId: 'owner',
+      timestamp: '2026-11-13T00:00:00.000Z',
+      inputConfig: { prompt: 'SYNTHETIC_STEER' } as never,
+    };
+    const sent: unknown[] = [];
+    const facade = (capabilities: Record<string, number>, feature: boolean) =>
+      createWorkspaceMachineRpcFacade({
+        workspaceId,
+        protectedContent: true,
+        getMachineProtocolCapabilities: async () => capabilities,
+        targetRouter: {
+          getPlaneForMachine: () => 'cloud',
+          resolvePlaneForMachine: async () => 'cloud',
+        },
+        getMachineRpcClient: async () =>
+          ({
+            requestSessionSteer: async (args: unknown) => {
+              sent.push(args);
+              return {
+                type: 'session/steer_response',
+                sessionId,
+                userTurnId: 'user-2',
+                applied: true,
+                disposition: 'applied',
+              };
+            },
+          }) as never,
+        ...(feature ? { requestEncryptedFeature: async () => ({ ok: false, error: 'x' }) } : {}),
+      });
+    expect(
+      await facade(
+        { ...CURRENT_MACHINE_PROTOCOL_CAPABILITIES, e2eeRemoteControl: 1 },
+        false
+      ).requestSessionSteer(remoteMachineId, steer)
+    ).toMatchObject({ applied: false, disposition: 'unsupported' });
+    expect(sent).toEqual([]);
+    expect(
+      await facade(
+        { ...CURRENT_MACHINE_PROTOCOL_CAPABILITIES, e2eeRemoteControl: 1 },
+        true
+      ).requestSessionSteer(remoteMachineId, steer)
+    ).toMatchObject({ applied: true });
+    expect(sent).toHaveLength(1);
+  });
+
   it('offers remote encrypted edit and resend only to an updated machine owner', () => {
     const machine = {
       ownerUserId: 'owner-account',
@@ -2011,7 +2049,7 @@ describe('encrypted remote files from a browser or mobile device', () => {
       code: 'permission_denied',
       retryable: false,
       message:
-        'Guests have read-only file access: saving, comparing changes, loading folders and change history are unavailable.',
+        "Guests can view a shared session's changes read-only, but cannot save, load folders or open change history.",
     };
     expect(save).toEqual(denied);
     expect(

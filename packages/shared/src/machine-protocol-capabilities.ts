@@ -33,6 +33,7 @@ export const MACHINE_PROTOCOL_CAPABILITIES = {
   e2eeAcpInteraction: 'e2eeAcpInteraction',
   e2eeSessionFork: 'e2eeSessionFork',
   e2eeSessionEditAndResend: 'e2eeSessionEditAndResend',
+  e2eeRemoteControl: 'e2eeRemoteControl',
   acpAuthenticationMethodSelection: 'acpAuthenticationMethodSelection',
   localProjectRemoval: 'localProjectRemoval',
   localProjectCreateDirectory: 'localProjectCreateDirectory',
@@ -68,7 +69,7 @@ export const MACHINE_PROTOCOL_CAPABILITIES = {
   codeCollabDiffBlobs: 'codeCollabDiffBlobs',
   sessionHistory: 'sessionHistory',
   sessionHistoryIncremental: 'sessionHistoryIncremental',
-  sessionHistoryWatch: 'sessionHistoryWatch',
+  sessionHistorySubscription: 'sessionHistorySubscription',
   sessionHistoryInspection: 'sessionHistoryInspection',
   sessionHistoryPatches: 'sessionHistoryPatches',
   sessionInputAcceptance: 'sessionInputAcceptance',
@@ -88,6 +89,8 @@ export const PROJECT_FOLDER_SELECTION_PROTOCOL_VERSION = 1;
 export const E2EE_SESSION_FORK_PROTOCOL_VERSION = 1;
 /** Encrypted feature RPC accepts `session/edit-and-resend` from the machine owner. */
 export const E2EE_SESSION_EDIT_AND_RESEND_PROTOCOL_VERSION = 1;
+/** Encrypted feature RPC accepts `E2EE_REMOTE_CONTROL_METHODS` (`e2ee-rpc.ts`). */
+export const E2EE_REMOTE_CONTROL_PROTOCOL_VERSION = 1;
 export const SESSION_DIRECTORY_LISTING_PROTOCOL_VERSION = 1;
 
 export const OPERATION_INBOX_PROTOCOL_VERSION = 2;
@@ -144,7 +147,7 @@ export const CODE_COLLAB_DIFF_BLOBS_PROTOCOL_VERSION = 1;
 /** v4 adds purpose-bound member read/edit proofs; older strict payloads are incompatible. */
 export const SESSION_HISTORY_PROTOCOL_VERSION = 4;
 export const SESSION_HISTORY_INCREMENTAL_PROTOCOL_VERSION = 1;
-export const SESSION_HISTORY_WATCH_PROTOCOL_VERSION = 1;
+export const SESSION_HISTORY_SUBSCRIPTION_PROTOCOL_VERSION = 1;
 export const SESSION_HISTORY_INSPECTION_PROTOCOL_VERSION = 2;
 export const SESSION_HISTORY_PATCHES_PROTOCOL_VERSION = 1;
 export const SESSION_INPUT_ACCEPTANCE_PROTOCOL_VERSION = 1;
@@ -294,7 +297,8 @@ export const CURRENT_MACHINE_PROTOCOL_CAPABILITIES: MachineProtocolCapabilities 
   [MACHINE_PROTOCOL_CAPABILITIES.sessionHistoryPatches]: SESSION_HISTORY_PATCHES_PROTOCOL_VERSION,
   [MACHINE_PROTOCOL_CAPABILITIES.sessionHistoryIncremental]:
     SESSION_HISTORY_INCREMENTAL_PROTOCOL_VERSION,
-  [MACHINE_PROTOCOL_CAPABILITIES.sessionHistoryWatch]: SESSION_HISTORY_WATCH_PROTOCOL_VERSION,
+  [MACHINE_PROTOCOL_CAPABILITIES.sessionHistorySubscription]:
+    SESSION_HISTORY_SUBSCRIPTION_PROTOCOL_VERSION,
   [MACHINE_PROTOCOL_CAPABILITIES.sessionHistoryInspection]:
     SESSION_HISTORY_INSPECTION_PROTOCOL_VERSION,
   [MACHINE_PROTOCOL_CAPABILITIES.sessionInputAcceptance]: SESSION_INPUT_ACCEPTANCE_PROTOCOL_VERSION,
@@ -366,14 +370,14 @@ export function machineSupportsSessionInputDispatch(
   );
 }
 
-export function machineSupportsSessionHistoryWatch(
+export function machineSupportsSessionHistorySubscription(
   machine: MachineProtocolCapabilityCarrier | null | undefined
 ): boolean {
   return (
     machineSupportsProtocolCapability(
       machine,
-      MACHINE_PROTOCOL_CAPABILITIES.sessionHistoryWatch,
-      SESSION_HISTORY_WATCH_PROTOCOL_VERSION
+      MACHINE_PROTOCOL_CAPABILITIES.sessionHistorySubscription,
+      SESSION_HISTORY_SUBSCRIPTION_PROTOCOL_VERSION
     ) && machineSupportsSessionHistoryIncremental(machine)
   );
 }

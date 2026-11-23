@@ -132,9 +132,8 @@ import {
   type LoroSessionData,
   type SessionTurn,
 } from '@lody/shared/session-data';
-import { redactProxyUrl, sanitizeUrlForLogging } from '@/utils/log-sanitize';
-import { getProxyForUrl } from 'proxy-from-env';
-import { HttpsProxyAgent } from 'https-proxy-agent';
+import { sanitizeUrlForLogging } from '@/utils/log-sanitize';
+import { resolveProxyAgent } from '@/utils/proxy';
 import type { RateLimit } from 'acp-extension-core';
 import type { RemoteCursorStore } from '@loro-dev/streams-crdt';
 import {
@@ -337,17 +336,14 @@ class ProxiedWebSocket extends WebSocketOriginal {
   constructor(url: string | URL, protocols?: string | string[]) {
     const urlString = typeof url === 'string' ? url : url.toString();
 
-    const targetForProxyEnv = urlString.replace(/^ws:/, 'http:').replace(/^wss:/, 'https:');
-
-    const proxyUrl = getProxyForUrl(targetForProxyEnv);
-    const agent = proxyUrl ? new HttpsProxyAgent(proxyUrl) : undefined;
+    const { agent, proxyUrlRedacted } = resolveProxyAgent(urlString);
 
     const logger = getLogger('loro:websocket');
     logger.debug(
-      `Creating WebSocket url=${sanitizeUrlForLogging(urlString)} proxy=${proxyUrl ? redactProxyUrl(proxyUrl) : 'none'} agentValid=${!!agent}`
+      `Creating WebSocket url=${sanitizeUrlForLogging(urlString)} proxy=${proxyUrlRedacted ?? 'none'} agentValid=${!!agent}`
     );
 
-    if ((globalThis as GlobalWithOptionalBun).Bun && proxyUrl) {
+    if ((globalThis as GlobalWithOptionalBun).Bun && proxyUrlRedacted) {
       logger.debug(
         'Bun does not support WebSocket proxy yet: https://github.com/oven-sh/bun/issues/14522'
       );
@@ -433,6 +429,7 @@ export interface LoroDocumentManagerOptions {
     | 'signScheduleDeclaration'
     | 'authorizeMachineTarget'
     | 'authorizeSessionTarget'
+    | 'requestFeature'
   >;
   streamsTokens?: CloudStreamsTokenPort | null;
   cloudBilling?: CloudBillingPort | null;
@@ -522,6 +519,7 @@ export class LoroDocumentManager {
     | 'signScheduleDeclaration'
     | 'authorizeMachineTarget'
     | 'authorizeSessionTarget'
+    | 'requestFeature'
   >;
   private readonly streamsTokens: CloudStreamsTokenPort | null;
   public readonly cloudBilling: CloudBillingPort | null;
@@ -540,6 +538,14 @@ export class LoroDocumentManager {
   ): Promise<boolean> {
     if (!this.encryptedWorkspace) throw new Error('e2ee_access_unavailable');
     return Effect.runPromise(this.encryptedWorkspace.authorizeSessionTarget(target));
+  }
+
+  /** Encrypted workspaces: one feature request signed as this machine; `null` is no reply. */
+  requestEncryptedFeature(
+    request: Parameters<CliE2eeWorkspaceLegacy['requestFeature']>[0]
+  ): ReturnType<CliE2eeWorkspaceLegacy['requestFeature']> {
+    if (!this.encryptedWorkspace) return Promise.reject(new Error('e2ee_rpc_unavailable'));
+    return this.encryptedWorkspace.requestFeature(request);
   }
 
   /** Encrypted workspaces: a one-shot command's machine access, from this process's ledger. */
@@ -623,6 +629,7 @@ export class LoroDocumentManager {
         | 'signScheduleDeclaration'
         | 'authorizeMachineTarget'
         | 'authorizeSessionTarget'
+        | 'requestFeature'
       >;
       streamsTokens?: CloudStreamsTokenPort | null;
       cloudBilling?: CloudBillingPort | null;
