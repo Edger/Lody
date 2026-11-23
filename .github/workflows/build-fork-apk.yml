@@ -80,6 +80,21 @@ jobs:
           grep -qF "applicationId = \"$PACKAGE_NAME\"" "$file"
           echo "Building $PACKAGE_NAME"
 
+      - name: Rename app label
+        working-directory: apps/mobile/android
+        run: |
+          set -euo pipefail
+          files="$(grep -rl 'name="app_name"' app/src/main/res || true)"
+          if [[ -z "$files" ]]; then
+            echo "::error::app_name resource not found; the upstream resources changed"
+            exit 1
+          fi
+          while IFS= read -r file; do
+            sed -i 's|<string name="app_name">[^<]*</string>|<string name="app_name">Lody(Staging)</string>|' "$file"
+            grep -qF '<string name="app_name">Lody(Staging)</string>' "$file"
+          done <<< "$files"
+          echo "Labelled the app Lody(Staging)"
+
       - name: Restore signing key
         env:
           ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
@@ -129,7 +144,7 @@ jobs:
           if [[ -z "$version" ]]; then
             version="unknown"
           fi
-          name="lody-release-${version}-$(date -u +%Y%m%dT%H%M%SZ)-${GITHUB_SHA:0:7}"
+          name="lody-staging-release-${version}-$(date -u +%Y%m%dT%H%M%SZ)-${GITHUB_SHA:0:7}"
           mkdir -p dist
           cp "$apk" "dist/${name}.apk"
           echo "name=${name}" >> "$GITHUB_OUTPUT"
