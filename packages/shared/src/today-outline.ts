@@ -111,7 +111,8 @@ export type TodayOutline = {
   getSubtree(rootId: TodayNodeId): TodayPageSnapshot | null;
   getNode(id: TodayNodeId): TodayNodeView | undefined;
   getText(id: TodayNodeId): LoroText | undefined;
-  insertFirst(text?: string): FocusIntent;
+  /** The first line of an empty page, or with `parentId` the first child of that node. */
+  insertFirst(text?: string, parentId?: TodayNodeId): FocusIntent;
   /** `intoChildren`: the new line becomes the first child (a zoomed root's title). */
   split(id: TodayNodeId, offset: number, options?: { intoChildren?: boolean }): FocusIntent;
   /** `within`: a zoomed root; its empty last child gets a sibling instead of leaving it. */
@@ -806,8 +807,12 @@ export function openTodayOutline(doc: LoroDoc, options: { origin?: string } = {}
       return node ? textOf(node) : undefined;
     },
 
-    insertFirst: (text = '') => {
-      const node = create(undefined, tree.roots().length, { text });
+    insertFirst: (text = '', parentId) => {
+      const parent = parentId ? live(parentId) : undefined;
+      if (parentId && !parent) return null;
+      const node = parent
+        ? create(parent, 0, { text })
+        : create(undefined, tree.roots().length, { text });
       commit();
       return { nodeId: node.id, offset: text.length };
     },
@@ -1223,24 +1228,26 @@ export function createTodayPageUndo(
   let groupText: LoroText | undefined;
   let cancelIdle: (() => void) | undefined;
 
-  const manager = new UndoManager(doc, {
-    mergeInterval: 0,
-    maxUndoSteps: 100,
-    excludeOriginPrefixes: ['sys:'],
-    onPush: () => {
-      if (!selection) return { value: null, cursors: [] };
-      if ('blockSelect' in selection) {
-        return { value: { blockSelect: selection.blockSelect }, cursors: [] };
-      }
-      const text = doc.getTree(TODAY_OUTLINE_TREE).getNodeByID(selection.nodeId)?.data.get('text');
-      const cursor = text instanceof LoroText ? text.getCursor(selection.focus) : undefined;
-      return { value: { nodeId: selection.nodeId }, cursors: cursor ? [cursor] : [] };
-    },
-    onPop: (_isUndo, { value, cursors }) => {
-      const intent = restoredIntent(value, cursors);
-      for (const listener of listeners) listener(intent);
-    },
-  });
+  const createManager = () =>
+    new UndoManager(doc, {
+      mergeInterval: 0,
+      maxUndoSteps: 100,
+      excludeOriginPrefixes: ['sys:'],
+      onPush: () => {
+        if (!selection) return { value: null, cursors: [] };
+        if ('blockSelect' in selection) {
+          return { value: { blockSelect: selection.blockSelect }, cursors: [] };
+        }
+        const text = doc.getTree(TODAY_OUTLINE_TREE).getNodeByID(selection.nodeId)?.data.get('text');
+        const cursor = text instanceof LoroText ? text.getCursor(selection.focus) : undefined;
+        return { value: { nodeId: selection.nodeId }, cursors: cursor ? [cursor] : [] };
+      },
+      onPop: (_isUndo, { value, cursors }) => {
+        const intent = restoredIntent(value, cursors);
+        for (const listener of listeners) listener(intent);
+      },
+    });
+  let manager = createManager();
 
   const restoredIntent = (value: unknown, cursors: Cursor[]): FocusIntent => {
     if (!value || typeof value !== 'object') return null;
@@ -1261,14 +1268,43 @@ export function createTodayPageUndo(
     manager.groupEnd();
   };
 
+  const resetManager = () => {
+    cancelIdle?.();
+    cancelIdle = undefined;
+    groupText = undefined;
+    manager.free();
+    manager = createManager();
+  };
+
+  const startGroup = (): boolean => {
+    try {
+      manager.groupStart();
+      return true;
+    } catch {
+      if (doc.isDetached()) return false;
+      manager.groupEnd();
+      try {
+        manager.groupStart();
+        return true;
+      } catch {
+        resetManager();
+        try {
+          manager.groupStart();
+          return true;
+        } catch {
+          return false;
+        }
+      }
+    }
+  };
+
   return {
     setSelection: (next) => {
       selection = next;
     },
     editText: (text, apply) => {
       if (groupText && groupText.id !== text.id) endGroup();
-      if (!groupText) {
-        manager.groupStart();
+      if (!groupText && startGroup()) {
         groupText = text;
       }
       apply(text);

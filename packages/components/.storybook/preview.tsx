@@ -1,5 +1,6 @@
 import type { Preview } from '@storybook/react-vite';
 import React, { useEffect, useLayoutEffect } from 'react';
+import * as stylex from '@stylexjs/stylex';
 import {
   Outlet,
   RouterContextProvider,
@@ -9,7 +10,7 @@ import {
   createRouter,
 } from '@tanstack/react-router';
 import { ConvexProvider, ConvexReactClient } from 'convex/react';
-import '../src/tailwind/index.css';
+import '../src/style/index.css';
 import {
   AuthenticatedConvexContext,
   type AuthenticatedConvexContextValue,
@@ -22,6 +23,14 @@ import { I18nextProvider } from 'react-i18next';
 import i18next from 'i18next';
 import { initReactI18next } from 'react-i18next';
 import { resources, defaultNS, ensureLanguageResources } from '../src/i18n';
+
+const styles = stylex.create({
+  canvas: {
+    height: '100%',
+    backgroundColor: 'hsl(var(--background) / 1)',
+    color: 'hsl(var(--foreground) / 1)',
+  },
+});
 
 function StorybookThemeMode({ theme, children }: { theme: Theme; children: React.ReactNode }) {
   const { previewTheme } = useTheme();
@@ -180,7 +189,7 @@ const preview: Preview = {
                 >
                   <StorybookThemeMode theme={theme}>
                     <Tooltip.Provider>
-                      <div className="h-full bg-background text-foreground">
+                      <div {...stylex.props(styles.canvas)}>
                         <Story />
                       </div>
                     </Tooltip.Provider>

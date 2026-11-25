@@ -32,8 +32,16 @@ import {
 } from '@lody/shared';
 import { prepareSessionInputAttachments } from '@/lib/session-input-attachments';
 import { createCommandAttachmentTransfer } from '@/lib/cloud-cli-port';
-import { snapshotAgentRole, readMessageAuthor, type AgentMessageAuthor } from '@lody/shared';
-import { resolveSessionMessageAuthor } from '@/session/message-author';
+import {
+  enrichAgentMessageAuthorModel,
+  snapshotAgentRole,
+  readMessageAuthor,
+  type AgentMessageAuthor,
+} from '@lody/shared';
+import {
+  resolveSessionMessageAuthor,
+  resolveSessionModelDisplayName,
+} from '@/session/message-author';
 import { resolveSessionLinkId } from '@lody/shared/session-link';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { createHash, randomUUID } from 'node:crypto';
@@ -454,6 +462,10 @@ const SessionRunConfigInputShape = {
     .optional()
     .describe('runConfig.reasoningEffortValues choice.'),
   fastMode: z.boolean().optional().describe('Fast on/off; requires runConfig.fastMode support.'),
+  speedTier: z
+    .enum(['normal', 'fast', 'ultrafast'])
+    .optional()
+    .describe('Speed tier choice; requires runConfig.speedTiers support.'),
   planMode: z.boolean().optional().describe('Plan on/off; requires runConfig.planMode support.'),
 };
 
@@ -1574,12 +1586,14 @@ const buildMcpTurnDispatchConfig = (input: {
   modelId?: string;
   reasoningEffort?: string;
   fastMode?: boolean;
+  speedTier?: 'normal' | 'fast' | 'ultrafast';
   planMode?: boolean;
 }): ResolvedTurnDispatchConfig => {
   const runConfig: AgentRunConfigSelection = {
     ...(input.modelId !== undefined ? { modelId: input.modelId } : {}),
     ...(input.reasoningEffort !== undefined ? { reasoningEffort: input.reasoningEffort } : {}),
     ...(input.fastMode !== undefined ? { fastMode: input.fastMode } : {}),
+    ...(input.speedTier !== undefined ? { speedTier: input.speedTier } : {}),
     ...(input.planMode !== undefined ? { planMode: input.planMode } : {}),
   };
   return {
@@ -1600,6 +1614,7 @@ const buildMcpRunConfigCanonicalCommand = (input: {
   modelId?: string;
   reasoningEffort?: string;
   fastMode?: boolean;
+  speedTier?: 'normal' | 'fast' | 'ultrafast';
   planMode?: boolean;
 }): Record<string, string | boolean | Record<string, string | boolean>> => ({
   ...(input.modeId !== undefined ? { modeId: input.modeId } : {}),
@@ -1609,6 +1624,7 @@ const buildMcpRunConfigCanonicalCommand = (input: {
   ...(input.modelId !== undefined ? { modelId: input.modelId } : {}),
   ...(input.reasoningEffort !== undefined ? { reasoningEffort: input.reasoningEffort } : {}),
   ...(input.fastMode !== undefined ? { fastMode: input.fastMode } : {}),
+  ...(input.speedTier !== undefined ? { speedTier: input.speedTier } : {}),
   ...(input.planMode !== undefined ? { planMode: input.planMode } : {}),
 });
 
@@ -2858,23 +2874,34 @@ const freezeInvokingAuthor = async (
   session: SessionMeta,
   invoking: InvokingTurnContext
 ): Promise<void> => {
+  const workspaceId = getMcpWorkspaceId(getSessionContext()) as WorkspaceId;
   const doc = await manager.getOrCreateSessionDoc(session.id);
   const backend = await createSessionBackend(doc);
   const turn = await backend.history.readTurn(`assistant:${invoking.identity.sourceTurnId}`);
   const storedAuthor = turn.state === 'ready' ? readMessageAuthor(turn.turn.author) : undefined;
-  const author =
+  const turnModelInfo = turn.state === 'ready' ? turn.turn.modelInfo : undefined;
+  let author =
     storedAuthor?.kind === 'agent' &&
     storedAuthor.sessionId === session.id &&
     storedAuthor.turnId === invoking.identity.sourceTurnId
-      ? storedAuthor
+      ? enrichAgentMessageAuthorModel(storedAuthor, turnModelInfo)
       : await resolveSessionMessageAuthor(
           manager,
           session,
           invoking.identity.sourceTurnId,
           invoking.frozenInputConfig,
-          undefined,
-          getMcpWorkspaceId(getSessionContext()) as WorkspaceId
+          turnModelInfo,
+          workspaceId
         );
+  if (author.model && (!author.model.name || author.model.name === author.model.id)) {
+    const modelName = await resolveSessionModelDisplayName(
+      manager,
+      session,
+      author.model.id,
+      workspaceId
+    );
+    author = enrichAgentMessageAuthorModel(author, undefined, modelName);
+  }
   invoking.identity.author = author;
 };
 

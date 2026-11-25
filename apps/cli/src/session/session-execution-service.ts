@@ -1286,6 +1286,10 @@ export class SessionExecutionService {
   isInboxInputCanceled(sessionId: SessionId, inputId: string): boolean {
     return this.operationInbox?.inputCanceled(this.deps.workspaceId, sessionId, inputId) ?? false;
   }
+  /** True once the input finished or was canceled; begin never admits it again. */
+  isInboxInputEnded(sessionId: SessionId, inputId: string): boolean {
+    return this.operationInbox?.inputEnded(this.deps.workspaceId, sessionId, inputId) ?? false;
+  }
   quiesceInboxExecutions(): void {
     this.shutdownAbort.abort();
     for (const runtime of this.turnRuntimeBySession.values()) {
@@ -7725,6 +7729,14 @@ export class SessionExecutionService {
               );
               runtime.disconnectedTransport = false;
               const restoredSession = yield* restoreRetiredSession();
+              self.deps.setSessionActivePresencePhase(sessionId, 'thinking');
+              yield* self.tryPromise(() => sessionDoc.setStatus(SessionStatusFactory.running()));
+              self.captureStatusChanged(sessionId, 'running', undefined, 'stale_acp_recovery');
+              self.scheduleLiveActivitySummarySync(userId, {
+                sessionId,
+                triggerReason: 'stale_acp_recovery',
+                status: 'running',
+              });
               yield* applyPromptConfig(restoredSession, 'stale_acp_recovery');
               yield* maybeRecordHistoryReplayNotice();
               yield* validatePromptCredentials(restoredSession, 'stale_acp_recovery');

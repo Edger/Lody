@@ -113,6 +113,7 @@ import {
 } from './presence-legacy';
 import { CliMachineMonitorRuntime } from './machine-monitor';
 import { CliPromptSuggestions } from './prompt-suggestions';
+import { SqliteRepoMaintenanceLegacy } from './sqlite-repo-maintenance';
 import type { LodyPromptSuggestion } from 'acp-extension-core';
 import {
   attachAutoMarkLatestUserHistoryAsRead,
@@ -141,6 +142,7 @@ import {
   hasPersistedFlockRemoteState,
   createDocumentRemoteCursorStore,
   createCliIncompleteRecoveryStore,
+  createSqliteRepoMaintenanceStore,
   ProcessDocumentRemoteCursorStore,
   type DocumentCursorScope,
 } from './sqlite-repo-store';
@@ -415,6 +417,7 @@ export interface LoroDocumentManagerOptions {
   sqliteRepoStore?: CliSqliteRepoStore | null;
   /** LoroDoc Streams cursors for this process; see `DocumentCursorScope`. */
   documentRemoteCursorStore?: RemoteCursorStore | null;
+  documentCursorScope?: DocumentCursorScope;
   remoteStreamsAttached?: boolean;
   attachCloudEphemeralSinks?: boolean;
   encryptedWorkspace?: Pick<
@@ -430,6 +433,7 @@ export interface LoroDocumentManagerOptions {
     | 'authorizeMachineTarget'
     | 'authorizeSessionTarget'
     | 'requestFeature'
+    | 'resolveVerifiedExecutionOriginal'
   >;
   streamsTokens?: CloudStreamsTokenPort | null;
   cloudBilling?: CloudBillingPort | null;
@@ -486,6 +490,7 @@ export class LoroDocumentManager {
   private readonly localLoroDataPlaneServer: LocalLoroDataPlaneServerLegacy | null;
   private readonly sqliteRepoStore: CliSqliteRepoStore | null;
   private readonly documentRemoteCursorStore: RemoteCursorStore | null;
+  private readonly sqliteRepoMaintenance: SqliteRepoMaintenanceLegacy | null;
   private remoteStreamsAttached: boolean;
   private remoteStreamsGeneration: number;
   private machineExistenceWatcher: RepoWatchHandle | null = null;
@@ -520,6 +525,7 @@ export class LoroDocumentManager {
     | 'authorizeMachineTarget'
     | 'authorizeSessionTarget'
     | 'requestFeature'
+    | 'resolveVerifiedExecutionOriginal'
   >;
   private readonly streamsTokens: CloudStreamsTokenPort | null;
   public readonly cloudBilling: CloudBillingPort | null;
@@ -562,6 +568,24 @@ export class LoroDocumentManager {
   ): Promise<string> {
     if (!this.encryptedWorkspace) throw new Error('e2ee_signature_unavailable');
     return this.encryptedWorkspace.signScheduleDeclaration(document, manualRunKey);
+  }
+
+  async verifyRoostInput(sessionId: string, entry: SessionHistoryInput, signer: string) {
+    if (!this.encryptedWorkspace || entry.role !== 'user' || !entry.e2eeIntent)
+      throw new Error('e2ee_signature_missing');
+    const result = await Effect.runPromise(
+      this.encryptedWorkspace.resolveVerifiedExecutionOriginal(
+        {
+          workspaceId: this.workspaceId,
+          sessionId,
+          userTurnId: entry.id,
+          inputConfig: entry.inputConfig,
+        },
+        { readUserTurn: async () => entry }
+      )
+    );
+    if (!result || !('requesterDevice' in result) || result.requesterDevice !== signer)
+      throw new Error('e2ee_signature_invalid');
   }
 
   /** Encrypted workspaces: the signed intent for an input this machine writes itself, to
@@ -630,6 +654,7 @@ export class LoroDocumentManager {
         | 'authorizeMachineTarget'
         | 'authorizeSessionTarget'
         | 'requestFeature'
+        | 'resolveVerifiedExecutionOriginal'
       >;
       streamsTokens?: CloudStreamsTokenPort | null;
       cloudBilling?: CloudBillingPort | null;
@@ -747,6 +772,7 @@ export class LoroDocumentManager {
         localLoroDataPlaneServer,
         sqliteRepoStore: cliSqliteRepoStore,
         documentRemoteCursorStore,
+        documentCursorScope: options.documentCursorScope ?? 'process',
         remoteStreamsAttached: false,
         attachCloudEphemeralSinks: options.attachCloudEphemeralSinks,
         streamsTokens: options.streamsTokens ?? null,
@@ -898,6 +924,31 @@ export class LoroDocumentManager {
         void this.encryptedWorkspace?.refresh();
       }
     );
+    if (options.documentCursorScope === 'shared-durable' && this.sqliteRepoStore) {
+      this.sqliteRepoMaintenance = new SqliteRepoMaintenanceLegacy({
+        repo: this.repo,
+        store: createSqliteRepoMaintenanceStore(
+          this.sqliteRepoStore,
+          options.documentCursorScope,
+          this.encryptedWorkspace?.bucketId()
+        ),
+        logger: this.logger,
+        isDocActive: (docId) => {
+          const sessionId = getSessionIdFromRoomId(docId);
+          if (
+            sessionId &&
+            (this.sessions.has(sessionId) ||
+              this.pendingSessionDocs.has(sessionId) ||
+              this.sessionDocCleanup.has(sessionId))
+          ) {
+            return true;
+          }
+          return this.localDocRoomBridges.has(docId);
+        },
+      });
+    } else {
+      this.sqliteRepoMaintenance = null;
+    }
   }
 
   private setTransportStatus(status: TransportConnectionStatus): void {
@@ -1713,12 +1764,21 @@ export class LoroDocumentManager {
       });
   }
 
+  private assertHistoryBackend(backend: SessionHistoryBackendKind | undefined): void {
+    if (
+      this.encryptedWorkspace &&
+      backend &&
+      backend !== 'loro' &&
+      (backend !== 'roost' || !this.encryptedWorkspace.repositoryDirectory)
+    )
+      throw new Error('e2ee_history_backend_unavailable');
+  }
+
   async getOrCreateSessionDoc(
     sessionId: SessionId,
     options: { historyBackend?: SessionHistoryBackendKind; skipAutoRead?: boolean } = {}
   ): Promise<SessionDocument> {
-    if (this.encryptedWorkspace && options.historyBackend && options.historyBackend !== 'loro')
-      throw new Error('e2ee_history_backend_unavailable');
+    this.assertHistoryBackend(options.historyBackend);
     const docId = getSessionRoomId(sessionId);
     // An activated SessionDocument owns the live cloud room from here on. Stop
     // any one-shot renderer reconciliation without unloading the shared doc.
@@ -1773,7 +1833,8 @@ export class LoroDocumentManager {
         sessionId,
         (sessionDocId) => this.unloadDocRoom(sessionDocId),
         this.logger,
-        this.sessionHistoryFactory ?? this.ownerHistoryRouter
+        this.sessionHistoryFactory ?? this.ownerHistoryRouter,
+        this.encryptedWorkspace?.repositoryDirectory
       );
       const meta = options.historyBackend ? undefined : await this.repo.getDocMeta(docId);
       const historyBackend =
@@ -1781,8 +1842,7 @@ export class LoroDocumentManager {
         (!isLoroRepoDocDeleted(meta)
           ? (meta?.meta as Partial<SessionMeta> | undefined)?.historyBackend
           : undefined);
-      if (this.encryptedWorkspace && historyBackend && historyBackend !== 'loro')
-        throw new Error('e2ee_history_backend_unavailable');
+      this.assertHistoryBackend(historyBackend);
       // Observation commands own an isolated manager and must not arm execution's
       // auto-seen/model-summary writers. This option applies to a new open only;
       // it never changes the policies of an already-owned cached document.
@@ -1834,14 +1894,14 @@ export class LoroDocumentManager {
         sessionId,
         (snapshotDocId) => this.unloadDocRoom(snapshotDocId),
         this.logger,
-        this.sessionHistoryFactory ?? this.ownerHistoryRouter
+        this.sessionHistoryFactory ?? this.ownerHistoryRouter,
+        this.encryptedWorkspace?.repositoryDirectory
       );
       const meta = await this.repo.getDocMeta(docId);
       const historyBackend = !isLoroRepoDocDeleted(meta)
         ? (meta?.meta as Partial<SessionMeta> | undefined)?.historyBackend
         : undefined;
-      if (this.encryptedWorkspace && historyBackend && historyBackend !== 'loro')
-        throw new Error('e2ee_history_backend_unavailable');
+      this.assertHistoryBackend(historyBackend);
       await sessionDoc.init({
         skipAutoRead: true,
         ...(historyBackend ? { historyBackend } : {}),
@@ -1887,14 +1947,14 @@ export class LoroDocumentManager {
           await this.unloadDocRoom(readDocId);
         },
         this.logger,
-        this.sessionHistoryFactory ?? this.ownerHistoryRouter
+        this.sessionHistoryFactory ?? this.ownerHistoryRouter,
+        this.encryptedWorkspace?.repositoryDirectory
       );
       const meta = await this.repo.getDocMeta(docId);
       const historyBackend = !isLoroRepoDocDeleted(meta)
         ? (meta?.meta as Partial<SessionMeta> | undefined)?.historyBackend
         : undefined;
-      if (this.encryptedWorkspace && historyBackend && historyBackend !== 'loro')
-        throw new Error('e2ee_history_backend_unavailable');
+      this.assertHistoryBackend(historyBackend);
       await sessionDoc.init({
         skipAutoRead: true,
         remoteSync: false,
@@ -2285,6 +2345,23 @@ export class LoroDocumentManager {
     await this.machine.updateAcpAuthMethods(configId, authMethods);
   }
 
+  async recordObservedAcpModelConfigOptions(
+    machineId: MachineId,
+    configId: AgentConfigId,
+    sourceVersion: string,
+    configOptions: AcpConfigOptionSummary[]
+  ): Promise<boolean> {
+    if (!this.machine) {
+      this.machine = this.createMachineDocument(machineId);
+      await this.machine.init();
+    }
+    return await this.machine.recordObservedAcpModelConfigOptions(
+      configId,
+      sourceVersion,
+      configOptions
+    );
+  }
+
   async getAcpCapabilities(
     machineId: MachineId,
     configId: AgentConfigId
@@ -2391,6 +2468,7 @@ export class LoroDocumentManager {
     }
     this.detachMachineFlockMetaRoomSyncedListener?.();
     this.detachMachineFlockMetaRoomSyncedListener = null;
+    await this.sqliteRepoMaintenance?.close();
     await this.machineFlockSync.cleanUp();
     await this.connectionRecovery.cleanUp();
     const attempt = async (scope: string, close: () => Promise<unknown>) => {
@@ -2637,7 +2715,8 @@ export class SessionDocument implements LoroDocument<Omit<SessionDocMeta, 'histo
      */
     private unloadDocRoom: (docId: string) => Promise<void>,
     private logger: Logger = getLogger('loro'),
-    readonly historyBackendFactory?: SessionBackendFactory
+    readonly historyBackendFactory?: SessionBackendFactory,
+    readonly encryptedRepositoryDirectory?: string
   ) {
     this.roomId = getSessionRoomId(this.sessionId);
   }
@@ -4421,6 +4500,36 @@ export class MachineDocument implements LoroDocument<{}, MachineMeta> {
     } else {
       await handle.syncOnce().catch(() => undefined);
     }
+  }
+
+  /**
+   * Passively records a model's live `configOptions` snapshot observed during an
+   * active session (model switch or `config_option_update`). Skips when no matching
+   * runtime capability row exists yet or when the stored per-model options are unchanged.
+   */
+  async recordObservedAcpModelConfigOptions(
+    configId: AgentConfigId,
+    sourceVersion: string,
+    configOptions: AcpConfigOptionSummary[]
+  ): Promise<boolean> {
+    const modelId = getAcpConfigOptionsModelId(configOptions);
+    if (!modelId || !sourceVersion || configOptions.length === 0) return false;
+    const handle = await this.openMachineFlockDoc();
+    const existing = getMachineFlockAcpCapabilities(
+      readMachineFlockRowsFromFlock(handle.flock, { families: ['acpCapability'] })
+    )[getAcpCapabilityCacheKey(configId)];
+    if (!existing || existing.sourceVersion !== sourceVersion) return false;
+    const changed = writeAcpModelConfigOptionsToFlock(handle.flock, configId, sourceVersion, {
+      [modelId]: configOptions,
+    });
+    if (!changed) return false;
+    await this.repo.flush();
+    if (this.markMachineFlockDirty) {
+      this.markMachineFlockDirty('acp-capability-update');
+    } else {
+      await handle.syncOnce().catch(() => undefined);
+    }
+    return true;
   }
 
   async getAcpCapabilities(configId: AgentConfigId): Promise<AcpCapabilityCacheEntry | undefined> {
