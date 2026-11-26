@@ -1,0 +1,173 @@
+name: Build fork APK
+
+# Personal fork only: builds a signed release APK with a renamed application ID.
+# Keeps the upstream build script untouched; the application ID is patched in the
+# runner's working tree and the signing key is injected through Gradle properties.
+on:
+  workflow_dispatch:
+    inputs:
+      package_name:
+        description: Application ID for this build
+        required: true
+        default: ai.lody.android.staging
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-fork-apk-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  apk:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Check out native Android client
+        run: git submodule update --init --remote apps/mobile/android
+
+      - name: Set up JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: gradle
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22.23.4'
+          cache: npm
+          cache-dependency-path: apps/mobile/android/runtime/package-lock.json
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@be39fa834029ff78f1a44aa3bb0819b8fc2bd8fd # v4.0.4
+        with:
+          packages: 'platforms;android-37.0 build-tools;36.0.0'
+
+      - name: Install runtime dependencies
+        working-directory: apps/mobile/android/runtime
+        run: npm ci --no-audit --no-fund
+
+      - name: Rename application ID
+        working-directory: apps/mobile/android
+        env:
+          PACKAGE_NAME: ${{ inputs.package_name }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$PACKAGE_NAME" =~ ^[A-Za-z][A-Za-z0-9_]*(\.[A-Za-z][A-Za-z0-9_]*)+$ ]]; then
+            echo "::error::Invalid application ID: $PACKAGE_NAME"
+            exit 1
+          fi
+          if [[ "$PACKAGE_NAME" == "ai.lody.android" ]]; then
+            echo "::error::Refusing to build with the upstream application ID"
+            exit 1
+          fi
+          file=app/build.gradle.kts
+          expected='applicationId = "ai.lody.android"'
+          if ! grep -qF "$expected" "$file"; then
+            echo "::error::applicationId line not found; the upstream build script changed"
+            grep -n "applicationId" "$file"
+            exit 1
+          fi
+          sed -i "s|$expected|applicationId = \"$PACKAGE_NAME\"|" "$file"
+          grep -qF "applicationId = \"$PACKAGE_NAME\"" "$file"
+          echo "Building $PACKAGE_NAME"
+
+      - name: Rename app label
+        working-directory: apps/mobile/android
+        run: |
+          set -euo pipefail
+          files="$(grep -rl 'name="app_name"' app/src/main/res || true)"
+          if [[ -z "$files" ]]; then
+            echo "::error::app_name resource not found; the upstream resources changed"
+            exit 1
+          fi
+          while IFS= read -r file; do
+            sed -i 's|<string name="app_name">[^<]*</string>|<string name="app_name">Lody(Staging)</string>|' "$file"
+            grep -qF '<string name="app_name">Lody(Staging)</string>' "$file"
+          done <<< "$files"
+          echo "Labelled the app Lody(Staging)"
+
+      - name: Restore signing key
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          : "${ANDROID_KEYSTORE_BASE64:?missing ANDROID_KEYSTORE_BASE64 secret}"
+          : "${ANDROID_KEYSTORE_PASSWORD:?missing ANDROID_KEYSTORE_PASSWORD secret}"
+          : "${ANDROID_KEY_ALIAS:?missing ANDROID_KEY_ALIAS secret}"
+          : "${ANDROID_KEY_PASSWORD:?missing ANDROID_KEY_PASSWORD secret}"
+          printf '%s' "$ANDROID_KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/release.jks"
+          install -d "$HOME/.gradle"
+          umask 077
+          cat >> "$HOME/.gradle/gradle.properties" <<EOF
+          android.injected.signing.store.file=$RUNNER_TEMP/release.jks
+          android.injected.signing.store.password=$ANDROID_KEYSTORE_PASSWORD
+          android.injected.signing.key.alias=$ANDROID_KEY_ALIAS
+          android.injected.signing.key.password=$ANDROID_KEY_PASSWORD
+          EOF
+
+      - name: Build release APK
+        working-directory: apps/mobile/android
+        run: ./gradlew :app:assembleRelease --no-daemon --console=plain --stacktrace
+
+      - name: Verify signature
+        run: |
+          set -euo pipefail
+          apk="$(ls apps/mobile/android/app/build/outputs/apk/release/*.apk | head -1)"
+          apksigner="$(find "$ANDROID_SDK_ROOT/build-tools" -name apksigner | sort -V | tail -1)"
+          "$apksigner" verify --print-certs "$apk"
+
+      - name: Stage APK
+        id: stage
+        run: |
+          set -euo pipefail
+          apk="$(ls apps/mobile/android/app/build/outputs/apk/release/*.apk | head -1)"
+          version=""
+          aapt="$(find "$ANDROID_SDK_ROOT/build-tools" -name aapt -type f 2>/dev/null | sort -V | tail -1 || true)"
+          if [[ -n "$aapt" ]]; then
+            version="$("$aapt" dump badging "$apk" | sed -n "s/.*versionName='\([^']*\)'.*/\1/p" | head -1)"
+          fi
+          if [[ -z "$version" ]]; then
+            version="$(sed -n 's/^[[:space:]]*versionName = "\([^"]*\)".*/\1/p' apps/mobile/android/app/build.gradle.kts | head -1)"
+          fi
+          if [[ -z "$version" ]]; then
+            version="unknown"
+          fi
+          name="lody-staging-release-${version}-$(date -u +%Y%m%dT%H%M%SZ)-${GITHUB_SHA:0:7}"
+          mkdir -p dist
+          cp "$apk" "dist/${name}.apk"
+          echo "name=${name}" >> "$GITHUB_OUTPUT"
+          echo "apk=dist/${name}.apk" >> "$GITHUB_OUTPUT"
+          echo "Publishing ${name}"
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.stage.outputs.name }}
+          path: ${{ steps.stage.outputs.apk }}
+          if-no-files-found: error
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NAME: ${{ steps.stage.outputs.name }}
+          APK: ${{ steps.stage.outputs.apk }}
+        run: |
+          set -euo pipefail
+          gh release create "$NAME" "$APK" \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "$NAME" \
+            --notes "Fork release APK for commit $GITHUB_SHA" \
+            --latest
