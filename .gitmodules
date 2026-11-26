@@ -27,7 +27,7 @@
 	url = https://github.com/LodyAI/lody-ios.git
 [submodule "apps/mobile/android"]
 	path = apps/mobile/android
-	url = https://github.com/LodyAI/lody-android.git
+	url = https://github.com/Edger/lody-android.git
 [submodule "skills"]
 	path = skills
 	url = https://github.com/LodyAI/skills.git
